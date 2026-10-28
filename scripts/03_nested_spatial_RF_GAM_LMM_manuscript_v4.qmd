@@ -1,0 +1,1422 @@
+---
+title: "Carbon stock modelling and mapping in Malagasy open ecosystems"
+subtitle: "RF vs GAM vs LMM, site-specific spatial blocks chosen by prediction-distance matching, nested spatial block CV (10 outer / 5 inner), 100 bootstrap maps (v4)"
+author: "N. Ramifehiarivo et al."
+date: today
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+  cache: false
+knitr:
+  opts_chunk:
+    dev: ragg_png
+    dpi: 200
+---
+
+# Overview
+
+This document reproduces the modelling framework of the manuscript *"Towards a better understanding of spatial carbon storage in open ecosystem areas of Madagascar"* (sections *Carbon stock modelling*, *Variogram analysis and spatial blocking*, *Nested spatial block cross-validation*, *Model evaluation and importance of carbon predictive covariates*, *Carbon stock mapping and uncertainty assessment*).
+
+| Manuscript step | Implementation here |
+|----|----|
+| Modelling scales | **All sites combined (ALL)** and **each site (AF, AT, IV)**; 7 pools: SOC 0–30, SOC 0–100, AGC, BGC, deadwood, litter, total C |
+| Covariates | 13 rasters per site: 10 continuous (Elevation, Slope, Edge, Roughness, TPI, TRI, cos/sin aspect, MAP, MAT) + 3 categorical (LC, Fire, Soil), **all extracted from the covariate rasters at the plot locations; the covariate columns of the CSV (NDVI included, it has no raster) are not used**. **No VIF pruning**: collinearity is documented (VIF, Spearman) and terrain covariates are interpreted as a group |
+| Variogram (diagnostic) | Residuals of a **non-spatial RF** (OOB); `gstat` fits Sph, Exp, Gau, Mat (lowest weighted SSE) and effective range (a, 3a, √3a); checked against `blockCV::cv_spatial_autocor`. **Reported next to the block size but no longer used to set it** |
+| Spatial blocks (v4) | **One design per site** (square / hexagonal blocks of several sizes or k-means clusters, found by a search that compares how well the CV test→train distances reproduce the map-prediction distances, plus leakage and fold balance; never on model scores). Same design for all pools and algorithms. **ALL = union of the site folds** |
+| Nested spatial CV | `blockCV::cv_spatial` / `cv_cluster`, random block-to-fold assignment, 100 iterations, balanced; **10 outer / 5 inner folds**, inner folds rebuilt inside every outer training set; variable selection **inside the outer training sets only** (VSURF for RF, forward CV selection for GAM, forward likelihood (AIC, ML) selection for LMM) |
+| RF | `ranger`, variance split rule, 1000 trees, `sample.fraction = 0.632`, replace = TRUE, permutation importance; `mtry` ∈ {2,4,6,8,10,13}, `min.node.size` ∈ {1,3,5,10} tuned in the inner loop |
+| GAM | `mgcv`, Gaussian/identity, `bs = "tp"`, REML, `select = TRUE`, `k` ∈ {3,5,8} tuned in the inner loop |
+| LMM | `lme4`, continuous covariates standardised, `(1 \| Site)` for ALL, `(1 \| block)` for site models, ML for selection / REML for the final fit, `re.form = NA` for prediction |
+| Metrics | R², RMSE, nRMSE (% of mean), MAE, RPD per outer fold → mean, SD, 95 % CI (t, K − 1 df) |
+| Model comparison | Paired Wilcoxon tests on per-fold MAE and RMSE, Holm correction across pairs and pools |
+| Best model | Lowest mean MAE and RMSE over the outer folds |
+| Importance | Main predictors = retained in ≥ 50 % of the outer training sets **and** mean %IncMSE ≥ 10 % of the largest %IncMSE (RF); direction from partial dependence |
+| Uncertainty / maps | **B = 100 bootstrap** refits (plots resampled with replacement **within blocks**) of the best model; per-pixel mean, SD, 2.5 / 97.5 percentiles; site totals in Tg C (Eq. 23) |
+
+**What changed in v4 (spatial blocking only; the models, metrics, importance and maps are unchanged).**
+
+1.  The block size is **no longer the variogram range of each pool** (hexagons, Eq. 12 of v3). A design is chosen once per **site** by a search on geometry (@sec-blocks); the winners found on the three sites are stored in `block_fixed` (`block_mode = "fixed"`), and `block_mode = "search"` re-derives them.
+2.  Outer folds, inner folds (rebuilt inside every outer training set) and the final-model inner folds are built **once** in a *fold plan* and reused by RF, GAM and LMM and by the seven pools.
+3.  **ALL scale = union of the site folds** (outer fold *k* = folds *k* of AF, AT and IV), so ALL and the site models are evaluated on exactly the same test plots, and no fold mixes distant sites.
+4.  The LMM random effect of the site models and the within-block bootstrap use the new blocks (`blk_`).
+5.  Cache folder `rds_v4`; the cache keys of the CV and final models contain a hash of the fold plan (and the best algorithm), so a change of blocking can never reuse stale results.
+
+**Inputs expected in `base_dir`**
+
+```         
+Datamapf_coordo.csv      carbon pools + Name, Site, X/Y (longitude/latitude, WGS84); covariate columns are ignored
+covariates_30m/          13 single-band rasters per site (EPSG:4326, pixel about 0.000278 degrees, one shared grid per site)
+    Cosaspect_<S>.tif  Edge_<S>.tif  ESA_<S>.tif  FF_<S>.tif  MAP_<S>.tif  MAT_<S>.tif  MNT_<S>.tif
+    Roughness_<S>.tif  Sinaspect_<S>.tif  Slope_<S>.tif  Soil_<S>.tif  TPI_<S>.tif  TRI_<S>.tif      (S = AF, AT, IV)
+```
+
+The rasters are searched recursively under `covariates_30m`, so they can sit in one folder or in `AF/`, `AT/`, `IV/` sub-folders. The covariate is read from the part of the file name before the site suffix (case-insensitive) and mapped to the model names through `cov_alias`:
+
+| Raster file | Model covariate | Type |
+|----|----|----|
+| `Cosaspect`, `Sinaspect` | `Cos_aspect`, `Sin_aspect` | continuous |
+| `MNT` | `Elevation` | continuous |
+| `Slope`, `Edge`, `Roughness`, `TPI`, `TRI`, `MAP`, `MAT` | same name | continuous |
+| `ESA` | `LC` | categorical (ESA WorldCover codes) |
+| `FF` | `Fire` | categorical (fire-frequency classes) |
+| `Soil` | `Soil` | categorical (soil-map codes) |
+
+Every site grid is the trimmed `Sinaspect` grid: cells outside the study-area shape are `NA` in all layers. Inside the shape, `MAP` and `MAT` (about 98.5 to 98.9 % coverage) and `Slope`, `TPI`, `TRI`, `Roughness` (99.9 % to 100 %) still hold a few `NA` cells. These gaps are filled from the neighbouring cells (`fill_gaps`) before extraction and mapping, so the models are trained on and applied to the same layers. **The covariates used to fit the models are extracted from these rasters at the plot locations** (the CSV is only used for the carbon pools, the site and the coordinates). NDVI is in the CSV but has no raster, so it is not used.
+
+**Runtime.** The full run (4 scales × 7 pools × (10 outer folds with VSURF + inner tuning for 3 algorithms) + 100 bootstrap models and their prediction on every raster cell) takes many hours. Every stage is **cached** in `outputs/modelling/rds_v4/` and skipped on re-run. `Sys.setenv(MADA_FAST = 1)` gives a quick test run.
+
+# Setup
+
+```{r}
+#| label: setup
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(sf)
+  library(terra)
+  library(ranger)
+  library(VSURF)
+  library(blockCV)
+  library(gstat)
+  library(mgcv)
+  library(lme4)
+  library(lmerTest)
+  library(openxlsx)
+  library(patchwork)
+  library(viridis)
+  library(ragg)
+  library(systemfonts)
+})
+
+## ============================== USER SETTINGS ====================================
+base_dir    <- Sys.getenv("MADA_BASE", here::here("data"))
+data_path   <- file.path(base_dir, "Datamapf_coordo.csv")
+cov_dir     <- file.path(base_dir, "covariates_30m")
+out_dir     <- here::here("outputs", "modelling")
+if (!file.exists(data_path)) stop("CSV not found: ", data_path, ". Set base_dir or the MADA_BASE environment variable.", call. = FALSE)
+if (!dir.exists(cov_dir)) stop("Covariate folder not found: ", cov_dir, call. = FALSE)
+
+coords_epsg <- 4326      # CRS of X/Y in Datamapf_coordo.csv (longitude / latitude)
+proj_epsg   <- 32738     # WGS84 / UTM 38S: metric CRS for variograms, blocks and maps
+
+sites   <- c("AF", "AT", "IV")
+scales  <- c("ALL", sites)                       # all sites combined + each site
+targets <- c(SOC30 = "SOC 0\u201330 cm", SOC100 = "SOC 0\u2013100 cm", AGC = "AGC", BGC = "BGC",
+             DW = "Deadwood", Litter = "Litter", TotC = "Total C")
+## (SOC 30-100 cm is also in the CSV as SOC30_100; add  SOC30_100 = "SOC 30\u2013100 cm"  to model it)
+
+pred_cont <- c("Elevation", "Slope", "Edge", "Roughness", "TPI", "TRI",
+               "Cos_aspect", "Sin_aspect", "MAP", "MAT")
+pred_cat  <- c("LC", "Fire", "Soil")
+
+raster_names <- c("Cosaspect", "Edge", "ESA", "FF", "MAP", "MAT", "MNT", "Roughness", "Sinaspect", "Slope", "Soil", "TPI", "TRI")
+cov_alias <- c(MNT = "Elevation", ESA = "LC", FF = "Fire", Cosaspect = "Cos_aspect", Sinaspect = "Sin_aspect")
+lc_labels <- c(`10` = "Tree cover", `20` = "Shrubland", `30` = "Grassland", `40` = "Cropland")
+
+## covariates of the plots are ALWAYS extracted from the rasters (the CSV covariate columns are ignored)
+extract_method <- "simple"   # continuous layers: "simple" (value of the cell containing the plot) or "bilinear"
+fill_gaps      <- TRUE       # NA cells inside the study-area footprint: filled from neighbouring cells (focal mean / mode)
+fill_window    <- 5          # focal window (cells) of one filling pass
+fill_max_iter  <- 12         # maximum number of passes
+map_agg_fact   <- 1          # 1 = predict maps on the native 30 m grid; 3 = 90 m grid (about 9 times faster)
+na_rescue_m    <- 45         # plot on a NA cell: mean (continuous) / most frequent class (categorical) of the valid cells within this radius (m); 0 = off
+
+## ---- random forest (Table 6)
+num_trees <- 1000;  num_trees_inner <- 300      # inner tuning uses fewer trees for speed (set = 1000 to be strict)
+mtry_grid <- c(2, 4, 6, 8, 10, 13);  nodesize_grid <- c(1, 3, 5, 10)
+## ---- VSURF (reduce for speed; manuscript values are the package defaults)
+vsurf_ntree <- 500;  vsurf_nfor <- c(thres = 20, interp = 10, pred = 10);  vsurf_parallel <- TRUE
+## ---- GAM
+k_grid <- c(3, 5, 8);  gam_k_select <- 5        # k used during forward selection; k tuned afterwards
+## ---- selection rules
+sel_min_gain  <- 0.005   # GAM forward selection: minimum relative RMSE gain to add a covariate
+lmm_delta_aic <- 2       # LMM forward selection: minimum AIC decrease to add a covariate
+sel_freq_min  <- 0.5     # main predictor: selected in >= 50 % of the outer training sets
+imp_rel_min   <- 0.10    # ... and mean %IncMSE >= 10 % of the largest %IncMSE (RF)
+## ---- spatial CV / bootstrap
+k_outer <- 10;  k_inner <- 5;  block_iter <- 100
+B_boot  <- 100
+## ---- spatial blocks (v4): one design per site; ALL = union of the site folds
+block_mode  <- "fixed"           # "fixed": use block_fixed | "search": re-run the design search (cached, a few minutes)
+block_fixed <- list(             # winners of the search (K = 10): block type, shape, size (m), seed of the block -> fold assignment
+  AF = list(type = "spatial", hexagon = FALSE, size = 11000, seed = 1),
+  AT = list(type = "spatial", hexagon = FALSE, size =  3500, seed = 3),
+  IV = list(type = "spatial", hexagon = FALSE, size =  1500, seed = 2))
+inner_seed    <- 1               # seed of the inner (5-fold) block assignments
+search_nseed  <- 5               # random block-to-fold assignments per candidate design (block_mode = "search")
+search_tol    <- 0.03            # designs within this W_rel of the best are "tied": most balanced folds wins
+search_min_nmin <- 4             # smallest acceptable outer test fold (mean over seeds)
+hull_buffer   <- 0.10            # map cells used for the distance matching: inside the plot hull + this fraction of the diagonal
+max_pred_cells <- 2500
+clip_negative <- TRUE            # carbon stocks cannot be negative: clip GAM/LMM/RF predictions at 0
+chunk_cells <- 1e5               # raster cells predicted at once
+map_scales <- scales             # scales for which maps are produced
+force_recompute <- FALSE
+n_threads <- max(1, parallel::detectCores() - 1)
+
+if (Sys.getenv("MADA_FAST") == "1") {            # quick test
+  k_outer <- 4; k_inner <- 3; B_boot <- 8; num_trees <- 200; num_trees_inner <- 80
+  vsurf_ntree <- 150; vsurf_nfor <- c(thres = 5, interp = 3, pred = 3); vsurf_parallel <- FALSE
+  targets <- targets[c("SOC30", "TotC")]
+}
+## ==================================================================================
+
+algos <- c("RF", "GAM", "LMM")
+rds_dir <- file.path(out_dir, "rds_v4"); fig_dir <- file.path(out_dir, "figures")
+map_dir <- file.path(out_dir, "maps"); tab_dir <- file.path(out_dir, "tables")
+walk(c(rds_dir, fig_dir, map_dir, tab_dir), dir.create, recursive = TRUE, showWarnings = FALSE)
+
+cached <- function(name, expr) {
+  f <- file.path(rds_dir, paste0(name, ".rds"))
+  if (file.exists(f) && !force_recompute) return(readRDS(f))
+  val <- expr; saveRDS(val, f); val
+}
+
+## ---- figure style
+fonts_found <- unique(systemfonts::system_fonts()$family)
+fam <- intersect(c("Arial", "Liberation Sans", "Helvetica"), fonts_found)[1]
+if (is.na(fam)) fam <- "sans"
+theme_nature <- function(base_size = 15, base_family = fam) {
+  theme_classic(base_size = base_size, base_family = base_family) +
+    theme(axis.line = element_line(colour = "black", linewidth = 0.5),
+          axis.ticks = element_line(colour = "black", linewidth = 0.5),
+          axis.text = element_text(colour = "black"), legend.position = "bottom",
+          strip.background = element_blank(), strip.text = element_text(face = "bold"),
+          plot.tag = element_text(face = "bold", size = base_size + 6))
+}
+theme_set(theme_nature())
+save_fig <- function(p, name, w, h) {
+  tryCatch({
+    ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = w, height = h, units = "in",
+           dpi = 600, device = ragg::agg_png, bg = "white")
+    ggsave(file.path(fig_dir, paste0(name, ".pdf")), p, width = w, height = h, units = "in", device = cairo_pdf)
+  }, error = function(e) warning("Figure not saved: ", name, ": ", conditionMessage(e), call. = FALSE))
+  invisible(p)
+}
+pal_scale <- c(ALL = "#3C5488", AF = "#E64B35", AT = "#4DBBD5", IV = "#00A087")
+pal_mod   <- c(RF = "#3C5488", GAM = "#F39B7F", LMM = "#00A087")
+fold_cols <- c("#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F", "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#8C8C8C")
+```
+
+# Data
+
+`Datamapf_coordo.csv` holds the plot carbon pools (`ST30` = SOC 0–30, `ST100` = SOC 0–100, `AGCGIEC`, `BGCGIEC`, `DWGIEC`, `LITERGIEC`, `TOTC`), the site and the plot coordinates (`X`, `Y`). **The covariates are not taken from the CSV**: they are extracted from the covariate rasters at the plot locations (next section). Any covariate column present in the CSV is ignored.
+
+```{r}
+#| label: data
+## ---- 1. read: auto-detect delimiter and decimal mark ----------------------
+first_lines <- readLines(data_path, n = 6, warn = FALSE, encoding = "UTF-8")
+count_ch <- function(ch) nchar(gsub(paste0("[^", ch, "]"), "", first_lines[1]))
+delim <- c(";", ",", "\t")[which.max(c(count_ch(";"), count_ch(","), count_ch("\t")))]
+dec   <- if (delim == ";" && any(grepl("[0-9],[0-9]", first_lines[-1]))) "," else "."
+
+raw <- readr::read_delim(data_path, delim = delim, trim_ws = TRUE, show_col_types = FALSE,
+                         locale = readr::locale(decimal_mark = dec))
+
+## ---- 2. harmonise column names (ignores case, dots, underscores, spaces) ----
+norm_nm <- function(x) toupper(gsub("[^A-Za-z0-9]", "", x))
+
+aliases <- list(                       # canonical name = accepted names in the CSV
+  SOC30 = "ST30", SOC100 = "ST100", SOC30_100 = c("ST30.100", "ST30_100"),
+  AGC = "AGCGIEC", BGC = "BGCGIEC", DW = "DWGIEC",
+  Litter = c("LITERGIEC", "LITTERGIEC"), TotC = "TOTC"
+)
+
+wanted <- unique(c("Name", "Site", "X", "Y", names(aliases), "LU"))
+for (nm in wanted) {
+  if (nm %in% names(raw)) next
+  hit <- which(norm_nm(names(raw)) %in% norm_nm(c(nm, aliases[[nm]])))
+  if (length(hit) >= 1) names(raw)[hit[1]] <- nm
+}
+
+## ---- 3. explicit check: say WHICH columns are missing -----------------------
+required <- c("Name", "Site", "X", "Y", names(targets))
+miss <- setdiff(required, names(raw))
+if (length(miss))
+  stop("Columns missing in the CSV: ", paste(miss, collapse = ", "),
+       "\nColumns found: ", paste(names(raw), collapse = ", "), call. = FALSE)
+
+unk <- setdiff(unique(toupper(trimws(raw$Site))), sites)
+if (length(unk))
+  stop("Unknown Site values: ", paste(unk, collapse = ", "),
+       " (expected: ", paste(sites, collapse = ", "), ")", call. = FALSE)
+
+## ---- 4. covariate columns of the CSV are NOT used (values come from the rasters)
+csv_cov <- names(raw)[norm_nm(names(raw)) %in%
+                        norm_nm(c(pred_cont, pred_cat, names(cov_alias), unname(cov_alias), "Aspect", "NDVI"))]
+if (length(csv_cov))
+  message("CSV covariate columns ignored (values are extracted from the rasters): ",
+          paste(csv_cov, collapse = ", "))
+
+dat <- raw |>
+  dplyr::select(-dplyr::any_of(csv_cov)) |>
+  dplyr::mutate(Site    = factor(toupper(trimws(Site)), levels = sites),
+                plot_id = trimws(as.character(Name)))
+
+stopifnot("duplicated plot names"      = !anyDuplicated(dat$plot_id),
+          "plots without coordinates"  = !anyNA(dat$X) && !anyNA(dat$Y))
+
+## metric coordinates for variograms and blocks
+xy <- dat |>
+  sf::st_as_sf(coords = c("X", "Y"), crs = coords_epsg, remove = FALSE) |>
+  sf::st_transform(proj_epsg) |>
+  sf::st_coordinates()
+dat$px <- xy[, 1]; dat$py <- xy[, 2]
+
+dplyr::count(dat, Site) |> knitr::kable(caption = "Plots per site")
+
+if ("LU" %in% names(dat))
+  print(knitr::kable(table(Site = dat$Site, `Field land use` = dat$LU),
+                     caption = "Plots per site and field land-use class"))
+
+## sanity check: TotC = sum of the pools
+chk <- with(dat, TotC - (SOC100 + AGC + BGC + DW + Litter))
+cat("Max |TotC - (SOC100 + AGC + BGC + DW + Litter)| =",
+    signif(max(abs(chk), na.rm = TRUE), 3), "Mg C/ha\n")
+```
+
+# Covariate rasters and extraction at the plots
+
+The covariates of every plot are **extracted from the rasters** (one set per site, all layers on the same grid). Continuous layers use `extract_method`; categorical layers always use the value of the cell that contains the plot. A plot that falls on a `NA` cell (edge of the clipped footprint, GPS error) takes the mean (continuous) or the most frequent class (categorical) of the valid cells within `na_rescue_m` metres; plots that still have a `NA` for a covariate used at a given scale are left out of that scale (reported in the *Covariates used per modelling scale* table). The same rasters are used later to map the predictions, so the models are trained on exactly the data they are applied to.
+
+```{r}
+#| label: rasters
+cov_lookup <- c(setNames(c(pred_cont, pred_cat), toupper(c(pred_cont, pred_cat))),
+                setNames(unname(cov_alias), toupper(names(cov_alias))))
+to_cov_name <- function(x) { k <- toupper(x); ifelse(k %in% names(cov_lookup), unname(cov_lookup[k]), x) }
+
+all_tifs <- list.files(cov_dir, pattern = "\\.(tif|tiff)$", full.names = TRUE, ignore.case = TRUE, recursive = TRUE)
+tif_stem <- tools::file_path_sans_ext(basename(all_tifs))
+
+raster_inventory <- function(site) {
+  suf <- paste0("[_-]", site, "$")
+  hit <- grepl(suf, tif_stem, ignore.case = TRUE)
+  inv <- tibble::tibble(file = all_tifs[hit], raster = sub(suf, "", tif_stem[hit], ignore.case = TRUE)) |>
+    dplyr::mutate(covariate = to_cov_name(raster))
+  if (!nrow(inv)) stop("No raster named <covariate>_", site, ".tif under ", cov_dir, call. = FALSE)
+  dup <- inv$file[toupper(inv$raster) %in% toupper(inv$raster[duplicated(toupper(inv$raster))])]
+  if (length(dup)) stop("Duplicated rasters for ", site, ":\n", paste(dup, collapse = "\n"), call. = FALSE)
+  miss <- setdiff(toupper(raster_names), toupper(inv$raster))
+  if (length(miss)) warning(site, ": expected rasters not found: ", paste(miss, collapse = ", "), call. = FALSE)
+  ign <- setdiff(inv$raster[!inv$covariate %in% c(pred_cont, pred_cat)], character(0))
+  if (length(ign)) message(site, ": rasters not used as covariates: ", paste(ign, collapse = ", "))
+  inv[inv$covariate %in% c(pred_cont, pred_cat), ]
+}
+
+fill_footprint_gaps <- function(r, fp, site) {
+  rep <- list()
+  for (v in names(r)) {
+    x <- r[[v]]
+    n0 <- terra::global(fp & is.na(x), "sum", na.rm = TRUE)[[1]]; n1 <- n0
+    if (fill_gaps && n0 > 0) {
+      fn <- if (v %in% pred_cat) "modal" else "mean"
+      for (i in seq_len(fill_max_iter)) {
+        x <- terra::focal(x, w = fill_window, fun = fn, na.policy = "only", na.rm = TRUE)
+        n1 <- terra::global(fp & is.na(x), "sum", na.rm = TRUE)[[1]]
+        if (n1 == 0) break
+      }
+      r[[v]] <- terra::mask(x, fp, maskvalues = FALSE)
+    }
+    rep[[v]] <- tibble::tibble(Site = site, Covariate = v, Footprint_cells = terra::global(fp, "sum", na.rm = TRUE)[[1]],
+                               NA_inside_footprint = n0, NA_after_fill = n1)
+  }
+  list(r = r, report = dplyr::bind_rows(rep))
+}
+
+load_site_rasters <- function(site) {
+  inv <- raster_inventory(site)
+  lst <- setNames(lapply(inv$file, \(f) terra::rast(f)[[1]]), inv$covariate)
+  ref_nm <- if ("Sin_aspect" %in% names(lst)) "Sin_aspect" else names(lst)[1]
+  ref <- lst[[ref_nm]]
+  moved <- names(lst)[!vapply(lst, \(x) isTRUE(terra::compareGeom(x, ref, stopOnError = FALSE)), logical(1))]
+  for (n in moved) lst[[n]] <- terra::resample(lst[[n]], ref, method = if (n %in% pred_cat) "near" else "bilinear")
+  if (length(moved)) warning(site, ": layers resampled to the ", ref_nm, " grid: ", paste(moved, collapse = ", "), call. = FALSE)
+  r <- terra::rast(unname(lst)); names(r) <- names(lst)
+  fill_footprint_gaps(r, !is.na(ref), site)
+}
+rasters_info <- setNames(lapply(sites, load_site_rasters), sites)
+rasters      <- lapply(rasters_info, `[[`, "r")
+fill_report  <- dplyr::bind_rows(lapply(rasters_info, `[[`, "report"))
+print(knitr::kable(fill_report |> dplyr::filter(NA_inside_footprint > 0), caption = "NA cells inside the study-area footprint before and after filling"))
+
+aggregate_for_map <- function(r) {
+  cn <- intersect(names(r), pred_cat); co <- setdiff(names(r), cn)
+  parts <- list()
+  if (length(co)) parts$co <- terra::aggregate(r[[co]], map_agg_fact, "mean", na.rm = TRUE)
+  if (length(cn)) parts$cn <- terra::aggregate(r[[cn]], map_agg_fact, "modal", na.rm = TRUE)
+  x <- do.call(c, unname(parts)); x[[names(r)]]
+}
+map_rasters <- if (map_agg_fact > 1) lapply(rasters, aggregate_for_map) else rasters
+
+purrr::walk2(rasters, names(rasters), \(r, s)
+  cat(s, ":", terra::nlyr(r), "layers (", paste(names(r), collapse = ", "), "); res =",
+      paste(signif(terra::res(r), 4), collapse = " x "),
+      if (terra::is.lonlat(r)) "deg" else "m",
+      "; CRS =", terra::crs(r, describe = TRUE)$code, "\n"))
+
+all_cov   <- c(pred_cont, pred_cat)
+cov_avail <- lapply(rasters, \(r) intersect(all_cov, names(r)))          # covariates with a raster, per site
+scale_cov <- function(sc) Reduce(intersect, cov_avail[if (sc == "ALL") sites else sc])
+
+miss_tab <- purrr::map_dfr(sites, \(s) tibble::tibble(
+  Site = s, `Covariates without raster` = paste(setdiff(all_cov, cov_avail[[s]]), collapse = ", ")))
+if (any(miss_tab[[2]] != "")) {
+  warning("Some covariates have no raster in some sites: they are not used at those scales.")
+  print(knitr::kable(miss_tab, caption = "Covariates without raster"))
+}
+
+## ---- extraction at the plot locations (once per site) ------------------------------------------
+extract_at_plots <- function(s) {
+  r   <- rasters[[s]]
+  d   <- dat[dat$Site == s, ]
+  pts <- sf::st_as_sf(d, coords = c("px", "py"), crs = proj_epsg)       # metric CRS
+  v   <- terra::vect(sf::st_transform(pts, terra::crs(r)))              # raster CRS
+  lay_cont <- intersect(pred_cont, names(r)); lay_cat <- intersect(pred_cat, names(r))
+
+  parts <- list()
+  if (length(lay_cont)) parts$cont <- terra::extract(r[[lay_cont]], v, ID = FALSE, method = extract_method)
+  if (length(lay_cat))  parts$cat  <- terra::extract(r[[lay_cat]],  v, ID = FALSE, method = "simple")
+  ex <- do.call(cbind, unname(parts))
+  na_before <- colSums(is.na(ex))
+
+  bad <- which(!stats::complete.cases(ex))                                # plots on a NA cell
+  if (length(bad) && na_rescue_m > 0) {
+    bf   <- terra::vect(sf::st_transform(sf::st_buffer(pts[bad, ], na_rescue_m), terra::crs(r)))
+    vals <- terra::extract(r[[names(ex)]], bf, touches = TRUE)           # ID + all cells within the radius
+    for (k in seq_along(bad)) {
+      vk <- vals[vals$ID == k, , drop = FALSE]
+      for (vn in names(ex)) if (is.na(ex[[vn]][bad[k]])) {
+        x <- vk[[vn]]; x <- x[!is.na(x)]
+        if (length(x)) ex[[vn]][bad[k]] <-
+          if (vn %in% pred_cat) as.numeric(names(which.max(table(x)))) else mean(x)
+      }
+    }
+  }
+  list(ex = ex, na_before = na_before, na_after = colSums(is.na(ex)))
+}
+ex_all <- setNames(lapply(sites, extract_at_plots), sites)
+
+## ---- covariate table of the plots (from the rasters only) ---------------------------------------
+cov_df <- as.data.frame(matrix(NA_real_, nrow(dat), length(all_cov), dimnames = list(NULL, all_cov)))
+for (s in sites) {
+  idx <- which(dat$Site == s); ex <- ex_all[[s]]$ex
+  for (v in names(ex)) cov_df[idx, v] <- ex[[v]]
+}
+dat <- dplyr::bind_cols(dat, cov_df)
+
+for (v in pred_cat) {                  # categorical covariates = factors of the raster class codes
+  x  <- round(dat[[v]]); lv <- sort(unique(x[!is.na(x)]))
+  dat[[v]] <- factor(as.character(x), levels = as.character(lv))
+}
+
+na_tab <- purrr::map_dfr(sites, \(s) tibble::tibble(
+  Site = s, Covariate = names(ex_all[[s]]$na_before), n_plots = sum(dat$Site == s),
+  NA_before_rescue = unname(ex_all[[s]]$na_before), NA_after_rescue = unname(ex_all[[s]]$na_after))) |>
+  dplyr::filter(NA_before_rescue > 0 | NA_after_rescue > 0)
+if (nrow(na_tab)) print(knitr::kable(na_tab, caption = "Plots on NA raster cells (before / after the radius rescue)"))
+
+## ---- plots used at each modelling scale: complete cases for the covariates available at that scale
+scale_data <- function(sc) {
+  d <- if (sc == "ALL") dat else dplyr::filter(dat, Site == sc)
+  dplyr::filter(d, dplyr::if_all(dplyr::all_of(scale_cov(sc)), \(x) !is.na(x)))
+}
+
+## ---- QA of the extracted covariates
+qa_cov <- purrr::map_dfr(sites, \(s) {
+  d <- dat[dat$Site == s, ]
+  purrr::map_dfr(cov_avail[[s]], \(v) {
+    x <- d[[v]]; is_c <- v %in% pred_cat
+    num <- function(f) if (is_c || all(is.na(x))) NA_real_ else f(x, na.rm = TRUE)
+    tibble::tibble(Site = s, Covariate = v, Type = if (is_c) "categorical" else "continuous",
+                   n_plots = length(x), n_NA = sum(is.na(x)),
+                   min = num(min), median = num(stats::median), max = num(max),
+                   n_classes = if (is_c) nlevels(droplevels(x)) else NA_integer_)
+  })
+})
+print(knitr::kable(qa_cov, digits = 3, caption = "Covariates extracted from the rasters at the plot locations"))
+
+lc_name <- unname(lc_labels[as.character(dat$LC)])
+print(knitr::kable(table(`ESA land cover (LC)` = paste0(dat$LC, ": ", dplyr::coalesce(lc_name, "other")), Site = dat$Site),
+                   caption = "Land-cover covariate (LC) per site, from the raster"))
+
+decode_cat <- function(x, lv) factor(as.character(round(x)), levels = lv)
+```
+
+# Predictors and collinearity
+
+All covariates that have a raster at the modelling scale are kept (Table 3 of the manuscript). Collinearity is **documented, not pruned**: the VIF (Eq. 9) and the Spearman correlations flag the DEM-derived terrain covariates, whose importance is interpreted as a group. Only constant variables inside a given scale (single class / zero variance) are dropped, because they cannot be modelled.
+
+```{r}
+#| label: predictors
+pred_sets <- setNames(map(scales, \(sc) {
+  d <- scale_data(sc)
+  avail <- scale_cov(sc)
+  cont <- intersect(pred_cont, avail)
+  cont <- cont[map_lgl(cont, \(v) isTRUE(sd(d[[v]], na.rm = TRUE) > 0))]
+  catg <- intersect(pred_cat, avail)
+  catg <- catg[map_lgl(catg, \(v) nlevels(droplevels(d[[v]])) > 1)]
+  list(cont = cont, cat = catg)
+}), scales)
+
+knitr::kable(map_dfr(scales, \(sc) tibble(Scale = sc, n = nrow(scale_data(sc)),
+  `Plots dropped (NA covariate)` = (if (sc == "ALL") nrow(dat) else sum(dat$Site == sc)) - nrow(scale_data(sc)),
+  `Continuous` = paste(pred_sets[[sc]]$cont, collapse = ", "),
+  `Categorical` = paste(pred_sets[[sc]]$cat, collapse = ", "),
+  `Dropped (constant / no raster)` = paste(setdiff(c(pred_cont, pred_cat), c(pred_sets[[sc]]$cont, pred_sets[[sc]]$cat)), collapse = ", "))),
+  caption = "Covariates used per modelling scale")
+
+vif_tab <- map_dfr(scales, \(sc) {
+  X <- scale_data(sc)[pred_sets[[sc]]$cont]
+  v <- tryCatch(diag(solve(cor(X))), error = function(e) setNames(rep(NA_real_, ncol(X)), names(X)))
+  tibble(Scale = sc, Covariate = names(v), VIF = unname(v))
+})
+rho_tab <- map_dfr(scales, \(sc) {
+  R <- cor(scale_data(sc)[pred_sets[[sc]]$cont], method = "spearman"); R[upper.tri(R, diag = TRUE)] <- NA
+  as_tibble(as.data.frame(as.table(R), stringsAsFactors = FALSE)) |> drop_na(Freq) |> filter(abs(Freq) > 0.8) |>
+    transmute(Scale = sc, Covariate_1 = Var1, Covariate_2 = Var2, Spearman = Freq)
+})
+vif_wide <- vif_tab |> pivot_wider(names_from = Scale, values_from = VIF)
+knitr::kable(vif_wide, digits = 1, caption = "Variance inflation factor (VIF > 10 = strong collinearity)")
+knitr::kable(rho_tab, digits = 2, caption = "Covariate pairs with |Spearman rho| > 0.8")
+```
+
+# Model functions
+
+```{r}
+#| label: model-fns
+rmse_fun <- function(o, p) sqrt(mean((o - p)^2))
+
+## --------------------------------------------------------------------------- geometry
+## (spatial block designs, fold plans and the design search are in the section "Spatial block design")
+extent_diag <- function(d) sqrt(diff(range(d$px))^2 + diff(range(d$py))^2)
+
+## --------------------------------------------------------------------------- factor handling
+harmonise <- function(train, test, catg) {
+  for (v in intersect(catg, names(train))) {
+    train[[v]] <- droplevels(train[[v]]); lv <- levels(train[[v]]); mf <- names(which.max(table(train[[v]])))
+    x <- as.character(test[[v]]); x[!x %in% lv] <- mf; test[[v]] <- factor(x, levels = lv)
+  }
+  list(train = train, test = test)
+}
+align_levels <- function(obj, nd) {
+  for (v in obj$cat) {
+    used <- obj$lv_used[[v]]; x <- as.character(nd[[v]]); x[!x %in% used] <- obj$modal[[v]]
+    nd[[v]] <- factor(x, levels = used)
+  }
+  nd
+}
+
+## --------------------------------------------------------------------------- RF
+rf_grid <- function(p) expand_grid(mtry = sort(unique(pmin(mtry_grid, p))), min.node.size = nodesize_grid)
+
+fit_rf <- function(df, y, preds, hp, ntree = num_trees, importance = "none", seed = 1) {
+  ranger(dependent.variable.name = y, data = as.data.frame(df[, c(y, preds)]), num.trees = ntree,
+         mtry = min(hp$mtry, length(preds)), min.node.size = hp$min.node.size, splitrule = "variance",
+         replace = TRUE, sample.fraction = 0.632, importance = importance,
+         respect.unordered.factors = "order", seed = seed, num.threads = n_threads)
+}
+
+vsurf_select <- function(df, y, cont, catg, seed = 1) {
+  preds <- c(cont, catg)
+  if (length(preds) < 2) return(preds)
+  x <- as.data.frame(df[, preds, drop = FALSE]); yy <- df[[y]]
+  for (par in unique(c(vsurf_parallel, FALSE))) {
+    set.seed(seed)
+    fit <- tryCatch(VSURF::VSURF(x = x, y = yy, ntree = vsurf_ntree, nfor.thres = vsurf_nfor[["thres"]],
+                                 nfor.interp = vsurf_nfor[["interp"]], nfor.pred = vsurf_nfor[["pred"]],
+                                 parallel = par, ncores = n_threads, clusterType = "PSOCK", verbose = FALSE),
+                    error = function(e) NULL)
+    if (!is.null(fit)) break
+  }
+  if (is.null(fit)) return(preds)
+  idx <- fit$varselect.pred                                  # prediction step
+  if (!length(idx)) idx <- fit$varselect.interp
+  if (!length(idx)) idx <- fit$varselect.thres
+  if (!length(idx)) return(preds)
+  preds[idx]
+}
+
+tune_rf <- function(df, y, sel, catg, inner_ids) {
+  grid <- rf_grid(length(sel)); folds <- sort(unique(inner_ids))
+  sc <- map_dfr(seq_len(nrow(grid)), \(i) {
+    r <- map_dbl(folds, \(f) {
+      h <- harmonise(df[inner_ids != f, ], df[inner_ids == f, ], catg)
+      m <- fit_rf(h$train, y, sel, grid[i, ], ntree = num_trees_inner)
+      rmse_fun(h$test[[y]], predict(m, as.data.frame(h$test[, sel, drop = FALSE]))$predictions)
+    })
+    bind_cols(grid[i, ], tibble(rmse = mean(r)))              # mean of the inner-fold RMSE
+  })
+  best <- sc[which.min(sc$rmse), ]
+  tibble(mtry = best$mtry, min.node.size = best$min.node.size, k = NA_real_, rmse = best$rmse)
+}
+
+## --------------------------------------------------------------------------- GAM
+gam_formula <- function(train, y, cont, catg, k) {
+  terms <- map_chr(cont, \(v) {
+    u <- length(unique(train[[v]]))
+    if (u >= 6) sprintf("s(%s, k = %d, bs = 'tp')", v, min(k, u - 1)) else v
+  })
+  rhs <- c(terms, catg); if (!length(rhs)) rhs <- "1"
+  as.formula(paste(y, "~", paste(rhs, collapse = " + ")))
+}
+fit_gam <- function(train, y, cont, catg, k) {
+  cont <- cont[map_lgl(cont, \(v) sd(train[[v]]) > 0)]
+  catg <- catg[map_lgl(catg, \(v) nlevels(droplevels(train[[v]])) > 1)]
+  for (v in catg) train[[v]] <- droplevels(train[[v]])
+  m <- tryCatch(mgcv::gam(gam_formula(train, y, cont, catg, k), data = as.data.frame(train), family = gaussian(),
+                          method = "REML", select = TRUE), error = function(e) NULL)
+  if (is.null(m)) NULL else list(model = m, cont = cont, cat = catg)
+}
+cv_gam <- function(df, y, sel, catg, inner_ids, k) {
+  folds <- sort(unique(inner_ids))
+  mean(map_dbl(folds, \(f) {
+    h <- harmonise(df[inner_ids != f, ], df[inner_ids == f, ], catg)
+    g <- fit_gam(h$train, y, intersect(sel, setdiff(names(h$train), catg)), intersect(sel, catg), k)
+    if (is.null(g)) return(Inf)
+    p <- tryCatch(as.numeric(predict(g$model, newdata = as.data.frame(h$test), type = "response")), error = function(e) NULL)
+    if (is.null(p)) Inf else rmse_fun(h$test[[y]], if (clip_negative) pmax(p, 0) else p)
+  }))
+}
+select_gam <- function(df, y, cont, catg, inner_ids) {          # forward selection on the inner-CV RMSE
+  cand <- c(cont, catg); sel <- character(0)
+  cvr <- function(s) cv_gam(df, y, s, catg, inner_ids, gam_k_select)
+  best <- cvr(sel)
+  repeat {
+    rem <- setdiff(cand, sel); if (!length(rem)) break
+    sc <- map_dbl(rem, \(v) cvr(c(sel, v))); j <- which.min(sc)
+    if (!is.finite(sc[j])) break
+    if (length(sel) > 0 && sc[j] > best * (1 - sel_min_gain)) break
+    sel <- c(sel, rem[j]); best <- min(best, sc[j])
+  }
+  sel
+}
+tune_gam <- function(df, y, sel, catg, inner_ids) {
+  sc <- map_dbl(k_grid, \(k) cv_gam(df, y, sel, catg, inner_ids, k))
+  tibble(mtry = NA_real_, min.node.size = NA_real_, k = k_grid[which.min(sc)], rmse = min(sc))
+}
+
+## --------------------------------------------------------------------------- LMM
+fit_lmm <- function(train, y, cont, catg, re, REML = TRUE) {
+  cont <- cont[map_lgl(cont, \(v) sd(train[[v]]) > 0)]
+  catg <- catg[map_lgl(catg, \(v) nlevels(droplevels(train[[v]])) > 1)]
+  mu <- map_dbl(train[cont], mean); sdv <- map_dbl(train[cont], sd)
+  sc <- function(d) { for (v in cont) d[[v]] <- (d[[v]] - mu[[v]]) / sdv[[v]]; d }   # standardised continuous covariates
+  tr <- sc(train); for (v in catg) tr[[v]] <- droplevels(tr[[v]])
+  fx <- c(cont, catg); rhs <- if (length(fx)) paste(fx, collapse = " + ") else "1"
+  m <- if (length(unique(tr[[re]])) >= 3) {
+    lme4::lmer(as.formula(paste(y, "~", rhs, "+ (1 |", re, ")")), data = as.data.frame(tr), REML = REML,
+               control = lme4::lmerControl(check.conv.singular = "ignore", check.conv.grad = "ignore",
+                                           check.nobs.vs.nlev = "ignore", check.nobs.vs.nRE = "ignore",
+                                           check.nobs.vs.rankZ = "ignore"))
+  } else lm(as.formula(paste(y, "~", rhs)), data = as.data.frame(tr))
+  list(model = m, sc = sc, cont = cont, cat = catg, re = re)
+}
+select_lmm <- function(df, y, cont, catg, re) {                 # forward selection, ML + AIC
+  cand <- c(cont, catg); sel <- character(0)
+  aic <- function(s) tryCatch(AIC(fit_lmm(df, y, intersect(s, cont), intersect(s, catg), re, REML = FALSE)$model),
+                              error = function(e) Inf)
+  best <- aic(sel)
+  repeat {
+    rem <- setdiff(cand, sel); if (!length(rem)) break
+    sc <- map_dbl(rem, \(v) aic(c(sel, v))); j <- which.min(sc)
+    if (!is.finite(sc[j])) break
+    if (length(sel) > 0 && sc[j] > best - lmm_delta_aic) break
+    sel <- c(sel, rem[j]); best <- min(best, sc[j])
+  }
+  sel
+}
+
+## --------------------------------------------------------------------------- generic wrappers
+select_vars <- function(algo, df, y, cont, catg, inner_ids, re_col, seed = 1) {
+  switch(algo,
+         RF  = vsurf_select(df, y, cont, catg, seed),
+         GAM = select_gam(df, y, cont, catg, inner_ids),
+         LMM = select_lmm(df, y, cont, catg, re_col))
+}
+tune_hp <- function(algo, df, y, sel, catg, inner_ids) {
+  switch(algo,
+         RF  = tune_rf(df, y, sel, catg, inner_ids),
+         GAM = tune_gam(df, y, sel, catg, inner_ids),
+         LMM = tibble(mtry = NA_real_, min.node.size = NA_real_, k = NA_real_, rmse = NA_real_))
+}
+fit_algo <- function(algo, df, y, sel, catg, hp, re_col, importance = "none", seed = 1) {
+  cont_s <- setdiff(sel, catg); cat_s <- intersect(sel, catg)
+  for (v in cat_s) df[[v]] <- droplevels(df[[v]])
+  obj <- list(algo = algo, y = y, sel = sel, cont = cont_s, cat = cat_s,
+              lv_used = map(df[cat_s], levels), modal = map(df[cat_s], \(x) names(which.max(table(x)))))
+  if (algo == "RF") {
+    obj$model <- fit_rf(df, y, sel, hp, importance = importance, seed = seed)
+  } else if (algo == "GAM") {
+    g <- fit_gam(df, y, cont_s, cat_s, hp$k); if (is.null(g)) return(NULL)
+    obj$model <- g$model; obj$cont <- g$cont; obj$cat <- g$cat
+  } else {
+    l <- fit_lmm(df, y, cont_s, cat_s, re_col, REML = TRUE)
+    obj$model <- l$model; obj$sc <- l$sc; obj$cont <- l$cont; obj$cat <- l$cat
+  }
+  obj
+}
+predict_algo <- function(obj, nd) {
+  if (is.null(obj)) return(rep(NA_real_, nrow(nd)))
+  nd <- align_levels(obj, nd)
+  p <- switch(obj$algo,
+    RF  = predict(obj$model, data = as.data.frame(nd[, obj$sel, drop = FALSE]), num.threads = n_threads)$predictions,
+    GAM = as.numeric(predict(obj$model, newdata = as.data.frame(nd), type = "response")),
+    LMM = { te <- obj$sc(nd)
+            as.numeric(if (inherits(obj$model, "merMod")) predict(obj$model, newdata = as.data.frame(te), re.form = NA, allow.new.levels = TRUE)
+                       else predict(obj$model, newdata = as.data.frame(te))) })
+  if (clip_negative) p <- pmax(p, 0)
+  p
+}
+
+## --------------------------------------------------------------------------- nested spatial CV
+## d carries the fold plan: outer_ (outer fold) and inner_o<f> (inner folds inside the training set of outer fold f)
+nested_cv <- function(d, y, cont, catg, re_col, seed = 1) {
+  preds_all <- c(cont, catg); pr <- list(); sl <- list(); hh <- list(); ids <- d$outer_
+  for (f in sort(unique(ids))) {
+    tr <- d[ids != f, ]; te <- d[ids == f, ]
+    if (nrow(te) == 0 || nrow(tr) < 15) next
+    inner_ids <- tr[[paste0("inner_o", f)]]                               # inner folds from the plan (same design, built inside this training set)
+    if (anyNA(inner_ids)) stop("inner folds missing for outer fold ", f)
+    h <- harmonise(tr, te, catg); tr <- h$train; te <- h$test
+    out <- tibble(plot_id = te$plot_id, fold = f, obs = te[[y]])
+    for (a in algos) {
+      res <- tryCatch({
+        sel <- select_vars(a, tr, y, cont, catg, inner_ids, re_col, seed = seed + f)   # inside the outer training set only
+        hp  <- tune_hp(a, tr, y, sel, catg, inner_ids)
+        obj <- fit_algo(a, tr, y, sel, catg, hp, re_col, importance = if (a == "RF") "permutation" else "none", seed = seed + f)
+        p   <- predict_algo(obj, te)
+        imp <- rep(NA_real_, length(preds_all)); names(imp) <- preds_all
+        if (a == "RF") {
+          vi <- obj$model$variable.importance; imp[] <- 0
+          imp[names(vi)] <- 100 * vi / max(obj$model$prediction.error, 1e-8)            # %IncMSE
+        }
+        list(p = p, sel = tibble(fold = f, algo = a, Predictor = preds_all, selected = preds_all %in% sel, pct_IncMSE = unname(imp)),
+             hp = bind_cols(tibble(fold = f, algo = a), hp))
+      }, error = function(e) { message("  fold ", f, " / ", a, " failed: ", conditionMessage(e)); NULL })
+      out[[a]] <- if (is.null(res)) NA_real_ else res$p
+      if (!is.null(res)) { sl[[length(sl) + 1]] <- res$sel; hh[[length(hh) + 1]] <- res$hp }
+    }
+    pr[[length(pr) + 1]] <- out
+  }
+  list(pred = bind_rows(pr), sel = bind_rows(sl), hp = bind_rows(hh))
+}
+
+## --------------------------------------------------------------------------- metrics (Eq. 13-19)
+fold_metrics <- function(obs, pred) {
+  ok <- is.finite(obs) & is.finite(pred); o <- obs[ok]; p <- pred[ok]; n <- length(o)
+  if (n < 3) return(tibble(n = n, R2 = NA_real_, RMSE = NA_real_, nRMSE = NA_real_, MAE = NA_real_, RPD = NA_real_))
+  rmse <- rmse_fun(o, p); sst <- sum((o - mean(o))^2)
+  tibble(n = n, R2 = if (sst > 0) 1 - sum((p - o)^2) / sst else NA_real_, RMSE = rmse,
+         nRMSE = if (mean(o) > 0) 100 * rmse / mean(o) else NA_real_, MAE = mean(abs(p - o)),
+         RPD = if (rmse > 0 && sd(o) > 0) sd(o) / rmse else NA_real_)
+}
+summ_ci <- function(x) {
+  x <- x[is.finite(x)]; K <- length(x)
+  m <- mean(x); s <- if (K > 1) sd(x) else NA_real_; h <- if (K > 1) qt(.975, K - 1) * s / sqrt(K) else NA_real_
+  tibble(mean = m, sd = s, lo = m - h, hi = m + h, K = K)
+}
+```
+
+# Spatial block design {#sec-blocks}
+
+**Why this changed (v4).** In v3 the block size came from the effective range of the variogram of RF residuals, separately for every pool and scale. Those ranges are short (a few hundred metres to about 2 km) compared with the extent of the sites (10 to 60 km), so they say little about how far a *map* extrapolates from the sampled plots, and the resulting hexagons were not checked against the prediction task. In v4 the block design is chosen **per site** and is **identical for the seven pools and for the three algorithms**. A design is judged only on *geometry*, never on model scores (choosing the blocks that give the best R² would make the validation dishonest):
+
+| Criterion | Meaning | Wanted |
+|----|----|----|
+| `W_rel` | Wasserstein distance between (i) the distance from each test plot to its nearest training plot in the CV and (ii) the distance from each map cell to its nearest sampled plot (map cells = study-area footprint inside the hull of the plots + 10 %), divided by the median of (ii) (NNDM logic, Milà et al. 2022) | small |
+| `leak` | share of test plots with a training plot closer than the spatial autocorrelation range of the pools (`blockCV::cv_spatial_autocor`, log(1 + pool)) | small |
+| `n_min`, `n_cv` | smallest outer test fold and coefficient of variation of the fold sizes | n_min ≥ 4, n_cv small |
+| `env_infl` | extrapolation in covariate space relative to a random k-fold (diagnostic) | not much above 1 |
+
+Candidates per site: square and hexagonal blocks of several sizes (multiples of the autocorrelation range and fractions of the extent), and k-means spatial clusters (`blockCV::cv_cluster`), each with `search_nseed` random block-to-fold assignments (`cv_spatial`, random selection, `r block_iter` iterations, balanced). **Selection rule:** among eligible designs within `search_tol` (0.03) of the lowest `W_rel`, take the one with the most balanced folds; within it, the seed with the lowest `W_rel` among seeds with `n_min` ≥ 4.
+
+* `block_mode = "fixed"` (default) uses the designs found by the search on the three sites (`block_fixed` in the settings), so the run is reproducible and fast.
+* `block_mode = "search"` re-runs the search here (cached) on the footprint rasters of the site.
+
+**Nested folds.** Outer folds: the winning design with K = `r k_outer`. Inner folds: **rebuilt inside every outer training set** with the same design (blocks shrunk by 15 % steps if the subset cannot fill `r k_inner` folds), so nothing from an outer test fold reaches model selection or tuning. A further set of `r k_inner` inner folds on all plots of a site is used for the final model. **All-sites (ALL) scale:** outer fold *k* is the union of the outer folds *k* of the three sites, and inner fold *j* of outer fold *k* is the union of the site inner folds. The three sites are far apart, so no ALL fold can leak across sites, and the ALL and site analyses share exactly the same test plots.
+
+```{r}
+#| label: block-fns
+if (utils::packageVersion("blockCV") < "4.0.0")
+  stop("blockCV >= 4.0.0 is required (cv_spatial(balance = ), cv_cluster(balance = )).", call. = FALSE)
+
+pts_sf <- function(d) sf::st_as_sf(d[, c("plot_id", "px", "py")], coords = c("px", "py"), crs = proj_epsg, remove = FALSE)
+
+## one blockCV call -> fold ids (+ block polygons for square / hexagonal designs)
+block_cv <- function(pts, design, k, seed) {
+  if (design$type == "cluster") {
+    o <- blockCV::cv_cluster(x = pts, k = k, balance = isTRUE(design$balance), seed = seed,
+                             report = FALSE, progress = FALSE)
+  } else {
+    o <- blockCV::cv_spatial(x = pts, k = k, size = design$size, hexagon = isTRUE(design$hexagon),
+                             selection = "random", iteration = block_iter, balance = TRUE, seed = seed,
+                             biomod2 = FALSE, plot = FALSE, report = FALSE, progress = FALSE)
+  }
+  list(ids = as.integer(o$folds_ids), blocks = o$blocks)
+}
+
+## same call, blocks shrunk by 15 % steps if the subset cannot fill k folds; spatial k-means as last resort
+build_folds <- function(pts, design, k, seed) {
+  sz <- if (design$type == "cluster") NA_real_ else design$size; o <- NULL
+  repeat {
+    des <- design; if (!is.na(sz)) des$size <- sz
+    o <- tryCatch(block_cv(pts, des, k, seed), error = function(e) NULL)
+    if (!is.null(o) && length(unique(o$ids)) >= 2) break
+    o <- NULL
+    if (is.na(sz) || sz < 1000) break
+    sz <- sz * 0.85
+  }
+  if (is.null(o)) {
+    warning("blockCV could not build ", k, " spatial folds; using spatial k-means clusters.", call. = FALSE)
+    set.seed(seed); xy <- sf::st_coordinates(pts)
+    o <- list(ids = as.integer(kmeans(scale(xy), centers = k, nstart = 20)$cluster), blocks = NULL)
+  }
+  o$size_used <- sz; o
+}
+
+## block id of every plot (random effect of the site LMMs, unit of the within-block bootstrap)
+block_id_of <- function(pts, o, s) {
+  if (is.null(o$blocks) || !"block_id" %in% names(o$blocks)) return(paste0(s, "_f", o$ids))
+  hit <- sf::st_intersects(pts, o$blocks)
+  paste0(s, "_b", vapply(hit, \(i) if (length(i)) o$blocks$block_id[i[1]] else NA_integer_, integer(1)))
+}
+
+design_label <- function(des) if (des$type == "cluster") "k-means (xy)" else
+  sprintf("%s %g km", if (isTRUE(des$hexagon)) "hexagon" else "square", des$size / 1000)
+
+## ---- fold plan of one site: outer folds, inner folds inside each outer training set, inner folds on all plots
+make_plan_site <- function(s, design) {
+  d <- dat[dat$Site == s, ]; pts <- pts_sf(d)
+  o <- build_folds(pts, design, k_outer, design$seed)
+  plan <- tibble::tibble(plot_id = d$plot_id, outer_ = o$ids, blk_ = block_id_of(pts, o, s))
+  for (f in seq_len(k_outer)) {
+    tr <- which(plan$outer_ != f); v <- rep(NA_integer_, nrow(d))
+    v[tr] <- build_folds(pts[tr, ], design, k_inner, inner_seed)$ids
+    plan[[paste0("inner_o", f)]] <- v
+  }
+  plan$inner_full <- build_folds(pts, design, k_inner, inner_seed)$ids
+  list(plan = plan, blocks = o$blocks, design = design, size_used = o$size_used)
+}
+
+## ---- geometry helpers (all distances in metres, UTM)
+nn_dist <- function(a, b) vapply(seq_len(nrow(a)), \(i) sqrt(min((b[, 1] - a[i, 1])^2 + (b[, 2] - a[i, 2])^2)), numeric(1))
+
+site_range <- function(s) {          # median spatial-autocorrelation range of the log(1 + pool) variograms (m)
+  d <- dat[dat$Site == s, ]; g <- pts_sf(d)
+  for (y in names(targets)) g[[y]] <- log1p(pmax(d[[y]], 0))
+  rg <- tryCatch(as.numeric(blockCV::cv_spatial_autocor(x = g, column = names(targets), plot = FALSE, progress = FALSE)$range),
+                 error = function(e) NA_real_)
+  dg <- extent_diag(d)
+  if (!is.finite(rg) || rg > dg) 0.15 * dg else rg
+}
+
+pred_cells <- function(s, xy) {      # map cells of the site (footprint) inside the plot hull + buffer
+  r <- rasters[[s]][[1]]
+  fct <- max(1, floor(sqrt(terra::ncell(r) / 40000)))
+  ra <- if (fct > 1) terra::aggregate(r, fct, "mean", na.rm = TRUE) else r
+  v <- terra::as.data.frame(ra, xy = TRUE, na.rm = TRUE)[, c("x", "y")]
+  g <- sf::st_transform(sf::st_as_sf(v, coords = c("x", "y"), crs = terra::crs(ra)), proj_epsg)
+  dg <- sqrt(diff(range(xy[, 1]))^2 + diff(range(xy[, 2]))^2)
+  hull <- sf::st_buffer(sf::st_convex_hull(sf::st_union(sf::st_as_sf(data.frame(x = xy[, 1], y = xy[, 2]),
+                                                                    coords = c("x", "y"), crs = proj_epsg))), hull_buffer * dg)
+  g <- g[sf::st_intersects(g, hull, sparse = FALSE)[, 1], ]
+  xyg <- sf::st_coordinates(g)
+  if (nrow(xyg) > max_pred_cells) { set.seed(1); xyg <- xyg[sample(nrow(xyg), max_pred_cells), , drop = FALSE] }
+  xyg
+}
+
+qs_grid <- seq(0.01, 0.99, length.out = 99)
+block_metrics <- function(xy, fold, Gij, rng, Z = NULL) {
+  n <- nrow(xy); tab <- table(fold)
+  Gs <- vapply(seq_len(n), \(i) { tr <- fold != fold[i]; sqrt(min((xy[tr, 1] - xy[i, 1])^2 + (xy[tr, 2] - xy[i, 2])^2)) }, numeric(1))
+  env <- if (is.null(Z)) NA_real_ else mean(vapply(seq_len(n), \(i) { tr <- fold != fold[i]
+    sqrt(min(colSums((t(Z[tr, , drop = FALSE]) - Z[i, ])^2))) }, numeric(1)))
+  c(n_folds = length(tab), n_min = min(tab), n_max = max(tab), n_cv = sd(tab) / mean(tab),
+    W_rel = mean(abs(quantile(Gs, qs_grid) - quantile(Gij, qs_grid))) / median(Gij),
+    med_test_train = median(Gs), med_pred = median(Gij), med_ratio = median(Gs) / median(Gij),
+    leak = mean(Gs < rng), env_nn = env)
+}
+
+## ---- the search (only run if block_mode == "search")
+search_block_design <- function(s, nseed = search_nseed) {
+  message("Block search: ", s)
+  d <- dat[dat$Site == s, ]; pts <- pts_sf(d); xy <- cbind(d$px, d$py); n <- nrow(d); dg <- extent_diag(d)
+  rng <- site_rng[[s]]; Gij <- Gij_site[[s]]
+  Z <- scale(as.matrix(d[, intersect(pred_cont, names(d))])); Z[!is.finite(Z)] <- 0
+  set.seed(1); rnd <- sample(rep_len(1:k_outer, n)); env_ref <- block_metrics(xy, rnd, Gij, rng, Z)[["env_nn"]]
+
+  sizes <- sort(unique(round(pmax(1500, c(max(rng, 0.1 * dg) * c(0.5, 1, 1.5, 2), dg * c(0.05, 0.08, 0.12, 0.18, 0.25))) / 500) * 500))
+  sizes <- sizes[sizes < 0.6 * dg]
+  cands <- list()
+  for (sz in sizes) for (hx in c(FALSE, TRUE))
+    cands[[length(cands) + 1]] <- list(id = sprintf("%s_%gkm", if (hx) "hex" else "sq", sz / 1000), type = "spatial", hexagon = hx, size = sz)
+  cands[[length(cands) + 1]] <- list(id = "kmeans_xy", type = "cluster", balance = FALSE)
+  cands[[length(cands) + 1]] <- list(id = "kmeans_xy_balanced", type = "cluster", balance = TRUE)
+
+  res <- list()
+  for (cd in cands) for (sdd in seq_len(nseed)) {
+    f <- tryCatch(block_cv(pts, cd, k_outer, sdd)$ids, error = function(e) NULL)
+    if (is.null(f)) next
+    m <- block_metrics(xy, f, Gij, rng, Z)
+    res[[length(res) + 1]] <- tibble::tibble(id = cd$id, seed = sdd, !!!as.list(m), env_infl = m[["env_nn"]] / env_ref)
+  }
+  res <- dplyr::bind_rows(res)
+  agg <- res |> dplyr::group_by(id) |>
+    dplyr::summarise(dplyr::across(c(n_folds, n_min, n_cv, W_rel, med_ratio, leak, env_infl), mean),
+                     W_sd = sd(W_rel), n_seeds = dplyr::n(), .groups = "drop") |>
+    dplyr::mutate(eligible = n_folds == k_outer & n_min >= search_min_nmin) |> dplyr::arrange(!eligible, W_rel)
+  e <- dplyr::filter(agg, eligible)
+  if (!nrow(e)) { warning(s, ": no design with n_min >= ", search_min_nmin, "; using all designs.", call. = FALSE); e <- agg }
+  near <- dplyr::filter(e, W_rel <= min(W_rel) + search_tol)
+  best_id <- near$id[which.min(near$n_cv)]
+  ok <- dplyr::filter(res, id == best_id, n_min >= search_min_nmin); if (!nrow(ok)) ok <- dplyr::filter(res, id == best_id)
+  best_seed <- ok$seed[which.min(ok$W_rel)]
+  cd <- cands[[which(vapply(cands, `[[`, "", "id") == best_id)]]
+  list(design = c(cd[setdiff(names(cd), "id")], list(seed = best_seed)), summary = agg, runs = res,
+       tied = near$id, random_ref = block_metrics(xy, rnd, Gij, rng, Z), range = rng)
+}
+```
+
+```{r}
+#| label: block-plan
+site_rng   <- vapply(sites, site_range, numeric(1))
+pred_xy    <- setNames(lapply(sites, \(s) pred_cells(s, cbind(dat$px[dat$Site == s], dat$py[dat$Site == s]))), sites)
+Gij_site   <- setNames(lapply(sites, \(s) nn_dist(pred_xy[[s]], cbind(dat$px[dat$Site == s], dat$py[dat$Site == s]))), sites)
+
+block_search <- if (block_mode == "search") cached("block_search", setNames(lapply(sites, search_block_design), sites)) else NULL
+block_design <- if (!is.null(block_search)) lapply(block_search, `[[`, "design") else block_fixed[sites]
+
+plans    <- setNames(lapply(sites, \(s) make_plan_site(s, block_design[[s]])), sites)
+plan_all <- c(setNames(lapply(sites, \(s) plans[[s]]$plan), sites),
+              list(ALL = dplyr::bind_rows(lapply(plans, `[[`, "plan"))))[scales]
+plan_tag <- substr(rlang::hash(plan_all), 1, 8)             # part of every cache key below
+
+plan_data <- function(sc, y) {                               # plots of a scale with their fold plan
+  d <- scale_data(sc) |> dplyr::filter(!is.na(.data[[y]])) |> dplyr::left_join(plan_all[[sc]], by = "plot_id")
+  if (anyNA(d$outer_)) stop("plots without a fold in the plan (", sc, " / ", y, ")", call. = FALSE)
+  d
+}
+
+if (!is.null(block_search)) {
+  for (s in sites) print(knitr::kable(utils::head(block_search[[s]]$summary, 8), digits = 3,
+    caption = sprintf("Block search, site %s: best candidates (autocorrelation range %.2f km; tied with the best W_rel: %s)",
+                      s, site_rng[[s]] / 1000, paste(block_search[[s]]$tied, collapse = ", "))))
+} else cat("block_mode = 'fixed': designs taken from block_fixed (result of the search on the three sites).\n")
+
+## ---- diagnostics of the designs actually used: blocks vs a random k-fold vs the prediction task
+block_diag <- purrr::map_dfr(sites, \(s) {
+  d <- dat[dat$Site == s, ]; xy <- cbind(d$px, d$py); pl <- plans[[s]]$plan
+  set.seed(1); rnd <- sample(rep_len(1:k_outer, nrow(d)))
+  mb <- block_metrics(xy, pl$outer_, Gij_site[[s]], site_rng[[s]]); mr <- block_metrics(xy, rnd, Gij_site[[s]], site_rng[[s]])
+  tibble::tibble(Scale = s, n = nrow(d), Design = design_label(block_design[[s]]), Seed = block_design[[s]]$seed,
+                 Block_size_km = if (is.null(plans[[s]]$size_used) || is.na(plans[[s]]$size_used)) NA_real_ else plans[[s]]$size_used / 1000,
+                 N_blocks = dplyr::n_distinct(pl$blk_), Autocorr_range_km = site_rng[[s]] / 1000,
+                 Outer_n_min = mb[["n_min"]], Outer_n_max = mb[["n_max"]],
+                 Median_dist_map_km = mb[["med_pred"]] / 1000, Median_dist_blocks_km = mb[["med_test_train"]] / 1000,
+                 Median_dist_random_km = mr[["med_test_train"]] / 1000,
+                 W_rel_blocks = mb[["W_rel"]], W_rel_random = mr[["W_rel"]], Leak_blocks = mb[["leak"]], Leak_random = mr[["leak"]])
+})
+knitr::kable(block_diag, digits = 2, caption = "Spatial block designs used (per site) and how well they reproduce the prediction task (median distance from a test plot to the nearest training plot vs from a map cell to the nearest plot)")
+
+fold_sizes <- purrr::map_dfr(scales, \(sc) {
+  p <- plan_all[[sc]]
+  purrr::map_dfr(seq_len(k_outer), \(f) tibble::tibble(Scale = sc, Outer_fold = f, n_test = sum(p$outer_ == f),
+                                                      Inner_n_min = min(table(p[[paste0("inner_o", f)]][p$outer_ != f]))))
+})
+fold_sizes |> dplyr::group_by(Scale) |>
+  dplyr::summarise(n_test_min = min(n_test), n_test_max = max(n_test), Inner_n_min = min(Inner_n_min), .groups = "drop") |>
+  knitr::kable(caption = "Outer test-fold sizes and smallest inner fold, per scale (ALL = union of the site folds)")
+```
+
+```{r}
+#| label: fig-blocks
+#| fig-width: 7.2
+#| fig-height: 9.6
+#| fig-cap: "Test folds of a random 10-fold CV (left) and of the spatial block CV used here (right), for each site. Colours are the outer test folds; shading shows the blocks. The title gives the median distance from a test plot to its nearest training plot."
+block_panel <- function(s, scheme) {
+  d <- dat[dat$Site == s, ]; xy <- cbind(d$px, d$py) / 1000; n <- nrow(d)
+  if (scheme == "random") { set.seed(1); fold <- sample(rep_len(1:k_outer, n)); bl <- NULL
+  } else { fold <- plans[[s]]$plan$outer_; bl <- plans[[s]]$blocks }
+  if (!is.null(bl)) { sf::st_geometry(bl) <- sf::st_geometry(bl) / 1000; bl$fold <- factor(bl$folds, levels = seq_len(k_outer)) }
+  dd <- data.frame(x = xy[, 1], y = xy[, 2], fold = factor(fold, levels = seq_len(k_outer)))
+  rx <- range(xy[, 1]); ry <- range(xy[, 2]); pad <- 0.07 * max(diff(rx), diff(ry))
+  xl <- c(rx[1] - pad, rx[2] + pad); yl <- c(ry[1] - pad, ry[2] + pad)
+  bar <- c(1, 2, 5, 10, 20, 50)[which.min(abs(c(1, 2, 5, 10, 20, 50) - diff(xl) / 5))]
+  md <- block_metrics(cbind(d$px, d$py), fold, Gij_site[[s]], site_rng[[s]])[["med_test_train"]] / 1000
+  p <- ggplot()
+  if (!is.null(bl) && "folds" %in% names(bl))
+    p <- p + geom_sf(data = bl, aes(fill = fold), colour = "grey25", linewidth = 0.25, alpha = 0.28, show.legend = FALSE, inherit.aes = FALSE)
+  p +
+    annotate("rect", xmin = xl[2] - 0.065 * diff(xl) - bar, xmax = xl[2] - 0.015 * diff(xl),
+             ymin = yl[1] + 0.015 * diff(yl), ymax = yl[1] + 0.115 * diff(yl), fill = "white", colour = NA, alpha = 0.88) +
+    geom_point(data = dd, aes(x, y, fill = fold), shape = 21, size = 1.8, stroke = 0.3, colour = "grey15") +
+    scale_fill_manual(values = fold_cols, drop = FALSE, name = "Test fold") +
+    annotate("segment", x = xl[2] - 0.04 * diff(xl) - bar, xend = xl[2] - 0.04 * diff(xl),
+             y = yl[1] + 0.05 * diff(yl), yend = yl[1] + 0.05 * diff(yl), linewidth = 0.9) +
+    annotate("text", x = xl[2] - 0.04 * diff(xl) - bar / 2, y = yl[1] + 0.075 * diff(yl), label = paste(bar, "km"), family = fam, size = 3.1, vjust = 0) +
+    coord_sf(xlim = xl, ylim = yl, expand = FALSE, datum = NA, crs = NULL) +
+    labs(title = sprintf("%s, %s: %.1f km", s, if (scheme == "random") "random k-fold" else "spatial blocks", md)) +
+    theme_void(base_family = fam) +
+    theme(plot.title = element_text(size = 10.5, hjust = 0, margin = margin(b = 3)),
+          panel.border = element_rect(colour = "grey20", fill = NA, linewidth = 0.5), plot.margin = margin(2, 4, 2, 4))
+}
+asp <- vapply(sites, \(s) { d <- dat[dat$Site == s, ]; (diff(range(d$py)) + 0.14 * max(diff(range(d$px)), diff(range(d$py)))) /
+                            (diff(range(d$px)) + 0.14 * max(diff(range(d$px)), diff(range(d$py)))) }, numeric(1))
+pl_blocks <- unlist(lapply(sites, \(s) list(block_panel(s, "random"), block_panel(s, "blocks"))), recursive = FALSE)
+fig_blocks <- patchwork::wrap_plots(pl_blocks, ncol = 2, heights = rep(asp + 0.12, each = 1)) +
+  patchwork::plot_layout(guides = "collect") + patchwork::plot_annotation(tag_levels = "a") &
+  theme(legend.position = "bottom", legend.text = element_text(size = 10), legend.title = element_text(size = 11, face = "bold"),
+        plot.tag = element_text(face = "bold", size = 15, family = fam)) &
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(size = 3.5)))
+save_fig(fig_blocks, "Fig_spatial_blocks", 7.2, 9.6); fig_blocks
+```
+
+# Residual spatial dependence (variogram, diagnostic)
+
+For every modelling scale and pool, a **non-spatial random forest** (all covariates, OOB predictions) is fitted and its residuals give the empirical variogram. Spherical, exponential, Gaussian and Matérn models are fitted by weighted least squares (`gstat`); the model with the lowest weighted SSE is kept. The effective range is *a* (spherical), 3*a* (exponential), √3*a* (Gaussian) and, for Matérn, the distance at which the model reaches 95 % of its sill. In v4 this is a **diagnostic**: it tells how much spatial dependence is left after the covariates and is reported next to the block size (a block larger than the effective range means that the residuals of test and training plots are practically independent). The block design itself comes from the section above. The ALL variogram mixes three distant sites and is shown for completeness only.
+
+```{r}
+#| label: variogram
+fit_vg <- function(d, y, ps) {
+  preds <- c(ps$cont, ps$cat); dd <- d |> filter(!is.na(.data[[y]]))
+  rf0 <- ranger(dependent.variable.name = y, data = as.data.frame(dd[, c(y, preds)]), num.trees = 500,
+                mtry = max(1, floor(length(preds) / 3)), min.node.size = 5, respect.unordered.factors = "order",
+                seed = 1, num.threads = n_threads)
+  dd$res <- dd[[y]] - rf0$predictions                                        # OOB residuals
+  g <- sf::st_as_sf(dd, coords = c("px", "py"), crs = proj_epsg, remove = FALSE)
+  cutoff <- extent_diag(dd) / 3
+  v <- gstat::variogram(res ~ 1, data = g, cutoff = cutoff, width = cutoff / 15)
+  cands <- map(c("Sph", "Exp", "Gau", "Mat"), \(m) {
+    ini <- gstat::vgm(psill = max(v$gamma) * 0.7, model = m, range = cutoff / 3, nugget = min(v$gamma) * 0.5, kappa = 1)
+    fit <- tryCatch(suppressWarnings(gstat::fit.variogram(v, ini, fit.kappa = (m == "Mat"))), error = function(e) NULL)
+    if (is.null(fit) || isTRUE(attr(fit, "singular")) || fit$range[2] <= 0) return(NULL)
+    list(model = m, fit = fit, sse = attr(fit, "SSErr"))
+  }) |> compact()
+  bc <- tryCatch(blockCV::cv_spatial_autocor(x = g, column = "res", plot = FALSE, progress = FALSE)$range,
+                 error = function(e) NA_real_)
+  if (!length(cands)) return(list(v = v, fit = NULL, model = NA_character_, eff_range = NA_real_, cutoff = cutoff,
+                                  n = nrow(dd), range_blockCV = bc))
+  best <- cands[[which.min(map_dbl(cands, "sse"))]]; r <- best$fit$range[2]
+  eff <- switch(best$model, Sph = r, Exp = 3 * r, Gau = sqrt(3) * r, Mat = {
+    vl <- gstat::variogramLine(best$fit, maxdist = cutoff * 5, n = 2000)
+    tot <- sum(best$fit$psill); i <- which(vl$gamma >= 0.95 * tot)[1]
+    if (is.na(i)) cutoff * 5 else vl$dist[i] })
+  list(v = v, fit = best$fit, model = best$model, eff_range = eff, cutoff = cutoff, n = nrow(dd),
+       nugget = best$fit$psill[1], psill = sum(best$fit$psill[-1]), range_blockCV = bc)
+}
+
+vg <- cached("variograms", {
+  res <- list()
+  for (sc in scales) for (y in names(targets)) {
+    message("Variogram: ", sc, " / ", y)
+    res[[paste(sc, y)]] <- fit_vg(scale_data(sc), y, pred_sets[[sc]])
+  }
+  res
+})
+
+vg_tab <- map_dfr(scales, \(sc) {
+  d <- scale_data(sc)
+  map_dfr(names(targets), \(y) {
+    o <- vg[[paste(sc, y)]]
+    tibble(Scale = sc, Pool = y, n = nrow(d), Model = o$model, Nugget = o$nugget %||% NA_real_, Sill = o$psill %||% NA_real_,
+           Eff_range_gstat = o$eff_range %||% NA_real_, Range_blockCV = o$range_blockCV %||% NA_real_)
+  })
+}) |> left_join(select(block_diag, Scale, Block_size_km), by = "Scale") |>
+  mutate(Block_to_range = Block_size_km * 1000 / Eff_range_gstat)
+vg_tab |> mutate(Pool = targets[Pool]) |>
+  knitr::kable(digits = 2, caption = "Residual variograms (non-spatial RF residuals): effective range (m) and block size of the site design (km; ALL = per-site blocks)")
+```
+
+```{r}
+#| label: fig-variogram
+#| fig-width: 16
+#| fig-height: 10
+#| fig-cap: "Empirical variograms of the residuals of a non-spatial random forest (points) with the fitted models (lines). Dashed vertical lines: effective range. Diagnostic only: the block design does not use these ranges."
+vg_pts <- map_dfr(scales, \(sc) map_dfr(names(targets), \(y) as_tibble(vg[[paste(sc, y)]]$v) |> mutate(Scale = sc, Pool = targets[[y]])))
+vg_lines <- map_dfr(scales, \(sc) map_dfr(names(targets), \(y) {
+  o <- vg[[paste(sc, y)]]; if (is.null(o$fit)) return(NULL)
+  as_tibble(gstat::variogramLine(o$fit, maxdist = o$cutoff)) |> mutate(Scale = sc, Pool = targets[[y]]) }))
+vg_rng <- vg_tab |> filter(!is.na(Eff_range_gstat)) |> transmute(Scale, Pool = targets[Pool], rng = Eff_range_gstat)
+lv_pool <- unname(targets)
+fig_vg <- ggplot() +
+  geom_point(data = vg_pts |> mutate(Pool = factor(Pool, lv_pool)), aes(dist, gamma, colour = Scale), size = 1.8) +
+  geom_line(data = vg_lines |> mutate(Pool = factor(Pool, lv_pool)), aes(dist, gamma, colour = Scale), linewidth = 0.8) +
+  geom_vline(data = vg_rng |> mutate(Pool = factor(Pool, lv_pool)), aes(xintercept = rng, colour = Scale), linetype = "dashed") +
+  scale_colour_manual(values = pal_scale, guide = "none") + facet_grid(Scale ~ Pool, scales = "free") +
+  labs(x = "Distance (m)", y = "Semivariance")
+save_fig(fig_vg, "FigS_variograms", 16, 10); fig_vg
+```
+
+# Nested spatial block cross-validation
+
+Outer loop: `r k_outer` spatial block folds from the fold plan (identical for RF, GAM, LMM and for the seven pools; ALL = union of the site folds). Inside every outer training set: variable selection (VSURF / forward GAM / forward LMM), then `r k_inner` inner spatial folds (same block design, built inside that training set) to tune the hyper-parameters; the model is refitted on the outer training set and predicts the outer test fold.
+
+```{r}
+#| label: nested-cv
+cv_res <- list()
+for (sc in scales) for (y in names(targets)) {
+  cv_res[[paste(sc, y)]] <- cached(sprintf("cv_%s_%s_%s", sc, y, plan_tag), {
+    message("Nested CV: ", sc, " / ", y)
+    d <- plan_data(sc, y)                                          # plots + fold plan (outer_, inner_o*, blk_ = random effect of the site LMMs)
+    ps <- pred_sets[[sc]]
+    r <- nested_cv(d, y, ps$cont, ps$cat, re_col = if (sc == "ALL") "Site" else "blk_", seed = 11)
+    r$folds <- tibble(plot_id = d$plot_id, fold = d$outer_)
+    r$pred <- r$pred |> mutate(Scale = sc, Pool = y, .before = 1)
+    r$sel  <- r$sel  |> mutate(Scale = sc, Pool = y, .before = 1)
+    r$hp   <- r$hp   |> mutate(Scale = sc, Pool = y, .before = 1)
+    r
+  })
+}
+cv_pred <- map_dfr(cv_res, "pred"); cv_sel <- map_dfr(cv_res, "sel"); cv_hp <- map_dfr(cv_res, "hp")
+
+cv_pred |> distinct(Scale, Pool, fold) |> count(Scale, Pool) |> mutate(Pool = targets[Pool]) |>
+  pivot_wider(names_from = Pool, values_from = n) |> knitr::kable(caption = "Number of outer spatial folds actually used")
+
+cv_long <- cv_pred |> pivot_longer(all_of(algos), names_to = "Model", values_to = "pred")
+
+## per-fold metrics (K = 10 outer folds) and their mean, SD and 95 % CI (t distribution, K - 1 df)
+fold_tab <- cv_long |> group_by(Scale, Pool, Model, fold) |> group_modify(\(d, k) fold_metrics(d$obs, d$pred)) |> ungroup()
+cv_summary <- fold_tab |> pivot_longer(c(R2, RMSE, nRMSE, MAE, RPD), names_to = "Metric", values_to = "value") |>
+  group_by(Scale, Pool, Model, Metric) |> group_modify(\(d, k) summ_ci(d$value)) |> ungroup()
+overall <- cv_long |> group_by(Scale, Pool, Model) |> group_modify(\(d, k) fold_metrics(d$obs, d$pred)) |> ungroup()
+
+cv_summary |> filter(Metric %in% c("MAE", "RMSE", "R2")) |>
+  mutate(txt = sprintf("%.2f \u00B1 %.2f", mean, sd), Pool = targets[Pool]) |>
+  select(Scale, Pool, Model, Metric, txt) |> pivot_wider(names_from = Metric, values_from = txt) |>
+  knitr::kable(caption = "Outer spatial CV accuracy: mean \u00B1 SD over the outer folds (MAE, RMSE in Mg C/ha)")
+```
+
+```{r}
+#| label: tests
+## paired Wilcoxon tests on the per-fold MAE and RMSE (identical folds for the three algorithms); Holm across pairs and pools
+wide <- fold_tab |> pivot_longer(c(MAE, RMSE), names_to = "Metric", values_to = "value") |>
+  select(Scale, Pool, Model, fold, Metric, value) |> pivot_wider(names_from = Model, values_from = value)
+pairs <- list(c("RF", "GAM"), c("RF", "LMM"), c("GAM", "LMM"))
+model_tests <- wide |> group_by(Scale, Pool, Metric) |>
+  group_modify(\(d, k) map_dfr(pairs, \(m) {
+    a <- d[[m[1]]]; b <- d[[m[2]]]; ok <- is.finite(a) & is.finite(b)
+    w <- tryCatch(suppressWarnings(wilcox.test(a[ok], b[ok], paired = TRUE)), error = function(e) NULL)
+    tibble(Comparison = paste(m, collapse = " vs "), K = sum(ok), Median_diff = median(a[ok] - b[ok]),
+           V = if (!is.null(w)) unname(w$statistic) else NA_real_, p = if (!is.null(w)) w$p.value else NA_real_)
+  })) |> ungroup() |>
+  group_by(Scale, Metric) |> mutate(p_Holm = p.adjust(p, "holm")) |> ungroup() |>
+  mutate(Better = ifelse(Median_diff < 0, word(Comparison, 1), word(Comparison, 3)))
+
+## Table 7 of the manuscript (per-fold MAE; RF vs GAM, RF vs LMM)
+tab7 <- cv_summary |> filter(Metric == "MAE") |> select(Scale, Pool, Model, mean) |> pivot_wider(names_from = Model, values_from = mean, names_prefix = "MAE_") |>
+  left_join(model_tests |> filter(Metric == "MAE", Comparison == "RF vs GAM") |> select(Scale, Pool, p_RF_vs_GAM = p_Holm), by = c("Scale", "Pool")) |>
+  left_join(model_tests |> filter(Metric == "MAE", Comparison == "RF vs LMM") |> select(Scale, Pool, p_RF_vs_LMM = p_Holm), by = c("Scale", "Pool")) |>
+  mutate(Pool = targets[Pool])
+knitr::kable(tab7, digits = 3, caption = "Paired Wilcoxon tests on per-fold MAE (Holm-adjusted p-values)")
+
+## best model = lowest mean MAE and RMSE over the outer folds (rank sum; ties broken by MAE)
+best_tab <- cv_summary |> filter(Metric %in% c("MAE", "RMSE")) |> select(Scale, Pool, Model, Metric, mean) |>
+  pivot_wider(names_from = Metric, values_from = mean) |> filter(is.finite(MAE), is.finite(RMSE)) |> group_by(Scale, Pool) |>
+  mutate(rk = rank(MAE) + rank(RMSE), agree = which.min(MAE) == which.min(RMSE)) |>
+  arrange(rk, MAE, .by_group = TRUE) |> slice(1) |> ungroup() |>
+  transmute(Scale, Pool, Best = Model, MAE_best = MAE, RMSE_best = RMSE, MAE_RMSE_agree = agree)
+knitr::kable(best_tab |> mutate(Pool = targets[Pool]), digits = 2, caption = "Best algorithm per scale and pool (lowest mean MAE and RMSE)")
+```
+
+```{r}
+#| label: fig-cv
+#| fig-width: 19
+#| fig-height: 14
+#| fig-cap: "Observed versus out-of-fold predicted values of the best algorithm of each scale and pool (nested spatial CV). Dashed line: 1:1. Text: RMSE, MAE and R2 over all out-of-fold predictions; best algorithm in brackets."
+lab_cv <- overall |> inner_join(best_tab, by = c("Scale", "Pool", "Model" = "Best")) |>
+  mutate(Pool = factor(targets[Pool], levels = lv_pool), Scale = factor(Scale, scales),
+         lab = sprintf("%s\nRMSE %.1f\nMAE %.1f\nR\u00B2 %.2f", Model, RMSE, MAE, R2))
+fig_cv <- cv_long |> inner_join(best_tab, by = c("Scale", "Pool", "Model" = "Best")) |>
+  mutate(Pool = factor(targets[Pool], levels = lv_pool), Scale = factor(Scale, scales)) |>
+  ggplot(aes(obs, pred, colour = Scale)) +
+  geom_abline(linetype = "dashed", colour = "grey40") + geom_point(alpha = 0.7, size = 1.6) +
+  geom_text(data = lab_cv, aes(x = -Inf, y = Inf, label = lab), hjust = -0.1, vjust = 1.1, size = 3.4,
+            family = fam, colour = "black", inherit.aes = FALSE) +
+  facet_grid(Scale ~ Pool, scales = "free") + scale_colour_manual(values = pal_scale, guide = "none") +
+  labs(x = expression("Observed (Mg C ha"^-1*")"), y = expression("Predicted (Mg C ha"^-1*")"))
+save_fig(fig_cv, "Fig_obs_vs_pred_nestedCV", 19, 14); fig_cv
+```
+
+```{r}
+#| label: fig-metrics
+#| fig-width: 17
+#| fig-height: 12
+#| fig-cap: "Nested spatial CV accuracy of RF, GAM and LMM: mean over the outer folds with 95 % confidence interval (t distribution)."
+fm <- cv_summary |> filter(Metric %in% c("MAE", "R2")) |>
+  mutate(Pool = factor(targets[Pool], levels = lv_pool), Scale = factor(Scale, scales))
+p_a <- ggplot(filter(fm, Metric == "MAE"), aes(Model, mean, colour = Model)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), size = 0.5) + facet_grid(Scale ~ Pool, scales = "free_y") +
+  scale_colour_manual(values = pal_mod, guide = "none") + labs(x = NULL, y = expression("MAE (Mg C ha"^-1*")"))
+p_b <- ggplot(filter(fm, Metric == "R2"), aes(Model, mean, colour = Model)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), size = 0.5) + facet_grid(Scale ~ Pool) +
+  scale_colour_manual(values = pal_mod, guide = "none") + labs(x = NULL, y = expression(R^2))
+fig_m <- p_a / p_b + plot_annotation(tag_levels = "a")
+save_fig(fig_m, "Fig_model_comparison_metrics", 17, 18); fig_m
+```
+
+# Final models, variable importance and bootstrap maps
+
+For every scale × pool, the **best algorithm** (previous section) is used. Final variable selection and hyper-parameter tuning are repeated on all plots (5 inner spatial folds); the model is then refitted on **B = `r B_boot` bootstrap resamples of the plots drawn with replacement within the spatial blocks of the design** (selected covariates and hyper-parameters kept fixed). Each bootstrap model predicts every raster cell: the per-pixel **mean** is the map, the **standard deviation** (Eq. 21) and the **2.5 / 97.5 percentiles** (Eq. 22) describe the sampling uncertainty of the mean prediction (not the prediction interval of a new plot). Site totals (Tg C) are computed for each bootstrap map (Eq. 23). Cells whose categorical covariates have a class absent from the training plots are masked.
+
+```{r}
+#| label: final-fns
+## ---- importance (nested CV), main-predictor rule
+imp_summary <- function(sc, y, algo) {
+  K <- n_distinct(cv_sel$fold[cv_sel$Scale == sc & cv_sel$Pool == y])
+  s <- cv_sel |> filter(Scale == sc, Pool == y, algo == !!algo) |> group_by(Predictor) |>
+    summarise(N_folds_selected = sum(selected), Freq = N_folds_selected / K,
+              pct_IncMSE_mean = mean(pct_IncMSE), pct_IncMSE_sd = sd(pct_IncMSE), .groups = "drop")
+  if (algo == "RF") {
+    s <- s |> mutate(Main = Freq >= sel_freq_min & pct_IncMSE_mean >= imp_rel_min * max(pct_IncMSE_mean, na.rm = TRUE))
+  } else s <- s |> mutate(Main = Freq >= sel_freq_min)
+  s |> arrange(desc(Freq), desc(pct_IncMSE_mean))
+}
+
+## ---- partial dependence (direction of the association)
+pd_effect <- function(obj, d, v) {
+  x <- d[[v]]
+  if (!v %in% obj$sel) return(tibble(Predictor = v, Direction = NA_character_, Spearman_PD = NA_real_, Effect_range = NA_real_, Detail = "not in the final model"))
+  if (is.factor(x)) {
+    lv <- levels(droplevels(x))
+    pdv <- map_dbl(lv, \(l) { nd <- d; nd[[v]] <- factor(l, levels = levels(x)); mean(predict_algo(obj, nd), na.rm = TRUE) })
+    return(tibble(Predictor = v, Direction = "categorical", Spearman_PD = NA_real_, Effect_range = diff(range(pdv)),
+                  Detail = paste0(lv, ": ", round(pdv, 1), collapse = "; ")))
+  }
+  g <- unique(quantile(x, seq(0.05, 0.95, length.out = 20), na.rm = TRUE))
+  pdv <- map_dbl(g, \(val) { nd <- d; nd[[v]] <- val; mean(predict_algo(obj, nd), na.rm = TRUE) })
+  rho <- suppressWarnings(cor(g, pdv, method = "spearman"))
+  dir <- if (is.na(rho) || abs(rho) < 0.5) "non-monotonic / flat" else if (rho > 0) "positive" else "negative"
+  tibble(Predictor = v, Direction = dir, Spearman_PD = rho, Effect_range = diff(range(pdv)),
+         Detail = sprintf("PD %.1f (P5 = %.2f) to %.1f (P95 = %.2f)", pdv[1], g[1], pdv[length(pdv)], g[length(g)]))
+}
+
+## ---- coefficients of the final GAM / LMM
+model_terms <- function(obj) {
+  tryCatch({
+    if (obj$algo == "GAM") {
+      sm <- summary(obj$model)
+      bind_rows(
+        if (!is.null(sm$s.table)) as_tibble(sm$s.table, rownames = "Term") |>
+          transmute(Term, Type = "smooth", Estimate = NA_real_, SE = NA_real_, EDF = edf, Statistic = F, p = `p-value`),
+        as_tibble(sm$p.table, rownames = "Term") |>
+          transmute(Term, Type = "parametric", Estimate = Estimate, SE = `Std. Error`, EDF = NA_real_, Statistic = `t value`, p = `Pr(>|t|)`)
+      ) |> mutate(Dev_explained = sm$dev.expl, R2_adj = sm$r.sq)
+    } else if (obj$algo == "LMM") {
+      m <- obj$model
+      if (inherits(m, "merMod")) {
+        co <- as.data.frame(summary(lmerTest::as_lmerModLmerTest(m))$coefficients)
+        tibble(Term = rownames(co), Estimate = co$Estimate, SE = co$`Std. Error`, Statistic = co$`t value`, p = co$`Pr(>|t|)`,
+               Random_var = as.data.frame(VarCorr(m))$vcov[1])
+      } else { co <- as.data.frame(summary(m)$coefficients)
+        tibble(Term = rownames(co), Estimate = co$Estimate, SE = co$`Std. Error`, Statistic = co$`t value`, p = co$`Pr(>|t|)`) }
+    } else NULL
+  }, error = function(e) tibble(Note = paste("failed:", conditionMessage(e))))
+}
+
+## ---- within-block bootstrap
+boot_index <- function(d, B, seed) {
+  set.seed(seed); blocks <- split(seq_len(nrow(d)), d$blk_)
+  map(seq_len(B), \(b) unlist(map(blocks, \(ix) if (length(ix) == 1) ix else sample(ix, length(ix), replace = TRUE)), use.names = FALSE))
+}
+
+## ---- bootstrap prediction of a site raster: mean, sd, 2.5 / 97.5 percentiles, totals (Tg C)
+predict_boot_raster <- function(rs, models, tag) {
+  obj1 <- models[[1]]; preds <- obj1$sel; rs <- rs[[preds]]
+  nc <- terra::ncell(rs); nB <- length(models)
+  asz <- terra::cellSize(rs[[1]], unit = "ha")      # cell area (ha), also correct for lon/lat rasters
+  vm <- vs <- vlo <- vhi <- rep(NA_real_, nc); tot <- numeric(nB); n_valid <- 0; n_mask <- 0; area_tot <- 0
+  bl <- terra::blocks(rs, n = max(1, ceiling(nc / chunk_cells)))
+  terra::readStart(rs); terra::readStart(asz); on.exit({ terra::readStop(rs); terra::readStop(asz) }, add = TRUE)
+  for (i in seq_len(bl$n)) {
+    v <- terra::readValues(rs, row = bl$row[i], nrows = bl$nrows[i], dataframe = TRUE)
+    inside <- rowSums(!is.na(v)) > 0
+    for (var in obj1$cat) v[[var]] <- decode_cat(v[[var]], levels(dat[[var]]))
+    a_ha <- terra::readValues(asz, row = bl$row[i], nrows = bl$nrows[i], mat = FALSE)
+    ok <- complete.cases(v); n_mask <- n_mask + sum(inside & !ok)
+    if (!any(ok)) next
+    vv <- v[ok, , drop = FALSE]
+    P <- do.call(cbind, map(models, \(m) predict_algo(m, vv)))
+    P <- matrix(P, nrow = sum(ok))
+    idx <- (bl$row[i] - 1) * terra::ncol(rs) + seq_len(bl$nrows[i] * terra::ncol(rs))
+    vm[idx[ok]] <- rowMeans(P); vs[idx[ok]] <- matrixStats::rowSds(P)
+    q <- matrixStats::rowQuantiles(P, probs = c(0.025, 0.975)); vlo[idx[ok]] <- q[, 1]; vhi[idx[ok]] <- q[, 2]
+    tot <- tot + colSums(P * a_ha[ok]) * 1e-6; n_valid <- n_valid + sum(ok); area_tot <- area_tot + sum(a_ha[ok])
+  }
+  mk <- function(x, nm) { r <- terra::rast(rs[[1]]); terra::values(r) <- x; names(r) <- nm; r }
+  out <- c(mk(vm, "mean"), mk(vs, "sd"), mk(vlo, "q025"), mk(vhi, "q975"))
+  f <- file.path(map_dir, paste0(tag, ".tif")); terra::writeRaster(out, f, overwrite = TRUE)
+  list(file = f, totals = tot, n_valid = n_valid, n_masked = n_mask, area_ha = area_tot)
+}
+
+final_one <- function(sc, y) {
+  d <- plan_data(sc, y); ps <- pred_sets[[sc]]; re_col <- if (sc == "ALL") "Site" else "blk_"
+  best <- best_tab$Best[best_tab$Scale == sc & best_tab$Pool == y]
+  inner <- d$inner_full                                    # inner spatial folds on all plots (from the plan)
+  sel <- select_vars(best, d, y, ps$cont, ps$cat, inner, re_col, seed = 99)
+  hp  <- tune_hp(best, d, y, sel, ps$cat, inner)
+  obj <- fit_algo(best, d, y, sel, ps$cat, hp, re_col, seed = 123)
+
+  isum <- imp_summary(sc, y, best); main <- isum$Predictor[isum$Main]
+  pd_obj <- if (best == "RF") fit_algo("RF", d, y, union(sel, main), ps$cat, hp, re_col, seed = 123) else obj
+  pd <- map_dfr(intersect(union(sel, main), c(ps$cont, ps$cat)), \(v) pd_effect(pd_obj, d, v))
+  isum <- isum |> left_join(pd, by = "Predictor")
+
+  ## bootstrap models (plots resampled with replacement within blocks)
+  bi <- boot_index(d, B_boot, seed = 1000 + match(sc, scales) * 10 + match(y, names(targets)))
+  models <- compact(map(seq_along(bi), \(b) tryCatch(fit_algo(best, d[bi[[b]], ], y, sel, ps$cat, hp, re_col, seed = b), error = function(e) NULL)))
+
+  ## maps and site totals
+  tot <- list(); files <- list()
+  if (sc %in% map_scales && length(models) >= 2) {
+    for (st in if (sc == "ALL") sites else sc) {
+      r <- predict_boot_raster(map_rasters[[st]], models, tag = sprintf("%s_%s_%s", sc, y, st))
+      files[[st]] <- r$file
+      tot[[st]] <- tibble(Scale = sc, Pool = y, Site = st, Algorithm = best, B = length(models),
+                          Pixels = r$n_valid, Masked_pixels = r$n_masked, Masked_pct = 100 * r$n_masked / max(r$n_valid + r$n_masked, 1), Area_ha = r$area_ha,
+                          Total_TgC_mean = mean(r$totals), Total_TgC_sd = sd(r$totals),
+                          Total_TgC_q025 = quantile(r$totals, .025), Total_TgC_q975 = quantile(r$totals, .975))
+    }
+  }
+  list(best = best, sel = sel, hp = hp, n = nrow(d), importance = isum, terms = model_terms(obj),
+       totals = bind_rows(tot), files = files, B_ok = length(models))
+}
+```
+
+```{r}
+#| label: final-run
+final <- list()
+for (sc in scales) for (y in names(targets)) {
+  final[[paste(sc, y)]] <- cached(sprintf("final_%s_%s_%s_%s", sc, y, best_tab$Best[best_tab$Scale == sc & best_tab$Pool == y], plan_tag), {
+    message("Final model + ", B_boot, " bootstraps + maps: ", sc, " / ", y)
+    final_one(sc, y)
+  })
+}
+hp_final <- imap_dfr(final, \(o, nm) tibble(Scale = word(nm, 1), Pool = targets[[word(nm, 2)]], n = o$n, Algorithm = o$best,
+                                          `Selected covariates` = paste(o$sel, collapse = ", "), mtry = o$hp$mtry,
+                                          min.node.size = o$hp$min.node.size, k = o$hp$k, `Inner-CV RMSE` = o$hp$rmse,
+                                          `Bootstrap models` = o$B_ok))
+knitr::kable(hp_final, digits = 2, caption = "Final models: algorithm, selected covariates and hyper-parameters (tuned with 5 inner spatial folds on all plots)")
+```
+
+## Variable importance
+
+**Main predictors:** selected by the variable-selection step in at least 50 % of the outer training sets **and**, for RF, mean %IncMSE ≥ 10 % of the largest mean %IncMSE of the model (non-selected covariates count as 0). Mean ± SD are taken over the outer folds; the direction comes from partial dependence (Spearman \|ρ\| \< 0.5 = non-monotonic / flat). DEM-derived covariates (Elevation, Slope, Roughness, TPI, TRI) are collinear and should be read as a group.
+
+```{r}
+#| label: vi-table
+vi_all <- imap_dfr(final, \(o, nm) o$importance |> mutate(Scale = word(nm, 1), Pool = word(nm, 2), Algorithm = o$best, .before = 1))
+
+## Table 8 of the manuscript: top-3 main predictors per scale and pool
+tab8 <- vi_all |> filter(Main) |> group_by(Scale, Pool) |>
+  arrange(desc(if_else(is.na(pct_IncMSE_mean), Freq, pct_IncMSE_mean)), .by_group = TRUE) |> slice_head(n = 3) |>
+  mutate(txt = if_else(Algorithm == "RF",
+                       sprintf("%s (%.1f \u00B1 %.1f; %s)", Predictor, pct_IncMSE_mean, pct_IncMSE_sd, coalesce(Direction, "NA")),
+                       sprintf("%s (selected in %.0f%% of folds; %s)", Predictor, 100 * Freq, coalesce(Direction, "NA"))),
+         rank = row_number()) |> ungroup() |>
+  select(Scale, Pool, Algorithm, rank, txt) |> pivot_wider(names_from = rank, values_from = txt, names_prefix = "Covariate ") |>
+  mutate(Pool = targets[Pool])
+knitr::kable(tab8, caption = "Main predictive covariates (%IncMSE \u00B1 SD over the outer folds for RF; direction from partial dependence)")
+```
+
+```{r}
+#| label: fig-vi
+#| fig-width: 17
+#| fig-height: 14
+#| fig-cap: "Mean permutation importance (%IncMSE, SD over the outer folds) of the covariates for the scale x pool combinations where RF is the best algorithm. Filled symbols: main predictors."
+vi_rf <- vi_all |> filter(Algorithm == "RF") |> mutate(Pool = factor(targets[Pool], levels = lv_pool), Scale = factor(Scale, scales))
+if (nrow(vi_rf)) {
+  ord <- vi_rf |> group_by(Predictor) |> summarise(m = mean(pct_IncMSE_mean, na.rm = TRUE)) |> arrange(m) |> pull(Predictor)
+  fig_vi <- ggplot(vi_rf, aes(pct_IncMSE_mean, factor(Predictor, ord), colour = Scale, shape = Main)) +
+    geom_pointrange(aes(xmin = pmax(pct_IncMSE_mean - pct_IncMSE_sd, 0), xmax = pct_IncMSE_mean + pct_IncMSE_sd),
+                    size = 0.4, position = position_dodge(0.6)) +
+    scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16), name = "Main predictor") +
+    scale_colour_manual(values = pal_scale) + facet_wrap(~Pool, ncol = 4, scales = "free_x") +
+    labs(x = "Permutation importance (%IncMSE)", y = NULL)
+  save_fig(fig_vi, "Fig_variable_importance", 17, 14); fig_vi
+}
+```
+
+## Maps (mean, standard deviation and 95 % interval of the bootstrap maps) and site totals
+
+```{r}
+#| label: maps-fn
+plot_maps <- function(sc, y, st, max_px = 900) {
+  o <- final[[paste(sc, y)]]; f <- o$files[[st]]; if (is.null(f)) return(NULL)
+  r <- terra::rast(f); k <- max(1, ceiling(max(dim(r)[1:2]) / max_px))
+  if (k > 1) r <- terra::aggregate(r, k, na.rm = TRUE)
+  df <- as.data.frame(r, xy = TRUE) |> drop_na(mean)
+  base <- list(coord_quickmap(), labs(x = NULL, y = NULL),
+               theme(axis.text = element_text(size = 9), legend.key.width = unit(1.6, "cm"), legend.position = "bottom"))
+  p1 <- ggplot(df, aes(x, y, fill = mean)) + geom_raster() + scale_fill_viridis_c(option = "viridis", name = expression("Mean (Mg C ha"^-1*")")) + base
+  p2 <- ggplot(df, aes(x, y, fill = sd)) + geom_raster() + scale_fill_viridis_c(option = "magma", name = expression("SD (Mg C ha"^-1*")")) + base
+  p3 <- ggplot(df, aes(x, y, fill = q975 - q025)) + geom_raster() + scale_fill_viridis_c(option = "magma", name = expression("95% interval width (Mg C ha"^-1*")")) + base
+  (p1 | p2 | p3) + plot_annotation(tag_levels = "a", title = sprintf("%s model: %s: %s (%s)", sc, st, targets[[y]], o$best),
+                                  theme = theme(plot.title = element_text(face = "bold", family = fam, size = 18)))
+}
+```
+
+```{r}
+#| label: maps-run
+#| fig-width: 18
+#| fig-height: 6.5
+shown <- FALSE
+for (sc in map_scales) for (y in names(targets)) for (st in names(final[[paste(sc, y)]]$files)) {
+  p <- plot_maps(sc, y, st)
+  if (!is.null(p)) { save_fig(p, sprintf("Map_%s_%s_%s", sc, y, st), 18, 6.5); if (!shown) { print(p); shown <- TRUE } }
+}
+
+totals <- map_dfr(final, "totals")
+if (nrow(totals)) totals <- mutate(totals, Pool = targets[Pool])
+knitr::kable(totals, digits = 3, caption = "Site totals (Tg C): mean, SD and 95 % interval over the bootstrap maps (Eq. 23)")
+```
+
+# Export of the tables
+
+```{r}
+#| label: export
+cv_tab <- cv_summary |> select(-K) |> mutate(Pool = targets[Pool]) |>
+  pivot_wider(names_from = Metric, values_from = c(mean, sd, lo, hi), names_glue = "{Metric}_{.value}")
+terms_all <- imap_dfr(final, \(o, nm) if (is.null(o$terms)) NULL else o$terms |> mutate(Scale = word(nm, 1), Pool = targets[[word(nm, 2)]], Algorithm = o$best, .before = 1))
+sheets <- list(Covariates = pred_sets |> imap_dfr(\(p, sc) tibble(Scale = sc, Continuous = paste(p$cont, collapse = ", "), Categorical = paste(p$cat, collapse = ", "))),
+               VIF = vif_wide, Spearman_gt_0.8 = rho_tab, QA_covariates = qa_cov,
+               Block_design = block_diag, Block_fold_sizes = fold_sizes, Fold_plan = bind_rows(plan_all[sites], .id = "Site"),
+               Block_search = if (!is.null(block_search)) bind_rows(imap(block_search, \(o, st) mutate(o$summary, Site = st, .before = 1))) else tibble(Note = "block_mode = fixed"),
+               Variogram_diag = vg_tab |> mutate(Pool = targets[Pool]),
+               CV_fold_metrics = fold_tab |> mutate(Pool = targets[Pool]),
+               CV_summary = cv_tab, CV_overall_OOF = overall |> mutate(Pool = targets[Pool]),
+               Table7_MAE_tests = tab7, Model_tests = model_tests |> mutate(Pool = targets[Pool]),
+               Best_model = best_tab |> mutate(Pool = targets[Pool]),
+               RF_GAM_tuning_inner = cv_hp |> mutate(Pool = targets[Pool]),
+               Final_models = hp_final, Importance = vi_all |> mutate(Pool = targets[Pool]),
+               Table8_main_predictors = tab8, GAM_LMM_terms = terms_all, Site_totals = totals,
+               CV_predictions = cv_pred |> mutate(Pool = targets[Pool]))
+wb <- createWorkbook()
+hs <- createStyle(textDecoration = "bold", border = "bottom", fontName = "Times New Roman", fontSize = 11)
+for (nm in names(sheets)) {
+  addWorksheet(wb, nm); writeData(wb, nm, sheets[[nm]], headerStyle = hs)
+  setColWidths(wb, nm, cols = seq_len(ncol(sheets[[nm]])), widths = "auto"); freezePane(wb, nm, firstRow = TRUE)
+}
+saveWorkbook(wb, file.path(tab_dir, "Tables_modelling_results.xlsx"), overwrite = TRUE)
+walk2(sheets, names(sheets), \(d, n) write_csv(d, file.path(tab_dir, paste0("Table_", n, ".csv"))))
+list.files(out_dir, recursive = TRUE) |> head(40)
+```
+
+# Methods text (draft, aligned with the manuscript)
+
+*Covariates.* Thirteen covariates (elevation, slope, edge, roughness, TPI, TRI, cosine and sine of aspect, MAP, MAT, land cover, fire frequency and soil type) were prepared per site on a common grid of about 30 m (EPSG:4326, 0.000278 degrees) clipped to the study-area shape; continuous layers were resampled with bilinear interpolation and categorical layers with nearest neighbour. Isolated empty cells inside the shape were filled from neighbouring cells. Covariate values at the plots were extracted from these rasters, and the same rasters were used for mapping.
+
+*Spatial blocking and evaluation.* Spatial blocks were designed for each site, and the same design was used for all pools and algorithms. For every site we generated candidate designs (square and hexagonal blocks of several sizes, expressed as multiples of the spatial autocorrelation range of the pools and as fractions of the site extent, and k-means spatial clusters; blockCV::cv_spatial and cv_cluster, random block-to-fold assignment over 100 iterations with fold balancing, five random assignments per design) and compared them on how well the distance between test and training plots in the cross-validation reproduced the distance between map cells and the nearest sampled plot (Wasserstein distance between the two distributions, restricted to the sampled area plus a 10 % buffer; NNDM logic), on the share of test plots closer to a training plot than the autocorrelation range, and on the balance of the fold sizes. Among the designs within 0.03 of the best distance match we retained the one with the most balanced folds. Designs were chosen on these geometric criteria only, never on model accuracy. The selected designs were square blocks of 11 km (AF), 3.5 km (AT) and 1.5 km (IV). Outer folds (K = 10) used the selected design; inner folds (K = 5) were rebuilt inside each outer training set with the same design, so that no information of an outer test fold entered variable selection or tuning. For the all-sites model, outer fold k was the union of the outer folds k of the three sites (and likewise for the inner folds), so that the all-sites and site-specific models were evaluated on the same test plots. RF (ranger; 1000 trees; mtry and min.node.size tuned in the inner loop; VSURF prediction-step selection), GAM (mgcv; thin-plate splines, REML with shrinkage; forward selection; k tuned in the inner loop) and LMM (lme4; likelihood-based forward selection; random intercept for site or spatial block; predictions with fixed effects only) were evaluated on identical folds with R², RMSE, nRMSE, MAE and RPD; the mean, standard deviation and t-based 95 % confidence interval over the outer folds are reported, and algorithms were compared with paired Wilcoxon signed-rank tests on per-fold MAE and RMSE with Holm correction. The algorithm with the lowest mean MAE and RMSE was used for mapping. Spatial dependence of the residuals of a non-spatial random forest (variograms, gstat) was used as a diagnostic.
+
+*Importance and uncertainty.* A covariate was considered a main predictor when it was retained in at least 50 % of the outer training sets and, for RF, had a mean %IncMSE of at least 10 % of the largest value; association directions were taken from partial dependence curves. Uncertainty was quantified with B = 100 bootstrap refits of the final model on plots resampled with replacement within the spatial blocks of the design; maps show the per-pixel mean, standard deviation and 2.5th–97.5th percentile interval, and site totals (Tg C) were summed over pixels for each bootstrap map.
+
+# Session information
+
+```{r}
+sessionInfo()
+```

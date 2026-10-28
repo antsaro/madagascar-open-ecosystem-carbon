@@ -1,0 +1,59 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below and the associated paper."
+title: "Code for: Towards a better understanding of spatial carbon storage in open ecosystem areas of Madagascar"
+type: software
+authors:
+  - family-names: Ramifehiarivo
+    given-names: Nandrianina
+    email: ranandrianina@gmail.com
+    affiliation: "Laboratoire des Radioisotopes (LRI), Université d'Antananarivo; École Supérieure des Sciences Agronomiques (ESSA), Université d'Antananarivo"
+  - family-names: Ratovoarimanana
+    given-names: Miralalaina Lovafitia
+    affiliation: "Laboratoire des Radioisotopes (LRI), Université d'Antananarivo"
+  - family-names: Andriamananjara
+    given-names: Andry
+    affiliation: "Laboratoire des Radioisotopes (LRI), Université d'Antananarivo"
+  - family-names: Devenish
+    given-names: Adam
+    affiliation: "Royal Botanic Garden Edinburgh; Royal Botanic Gardens, Kew"
+  - family-names: Bouillon
+    given-names: Steven
+    affiliation: "KU Leuven"
+  - family-names: Lehmann
+    given-names: Caroline
+    affiliation: "Royal Botanic Garden Edinburgh; University of Edinburgh"
+  - family-names: Andriantiavina
+    given-names: Mahefasoa Prosper
+    affiliation: "École Supérieure des Sciences Agronomiques (ESSA), Université d'Antananarivo"
+  - family-names: Ramanandraibe
+    given-names: Iorenantsoa
+    affiliation: "École Supérieure des Sciences Agronomiques (ESSA), Université d'Antananarivo"
+  - family-names: Solonirina
+    given-names: Marcelle
+    affiliation: "École Supérieure des Sciences Agronomiques (ESSA), Université d'Antananarivo"
+  - family-names: Fataka
+    given-names: Annécka
+    affiliation: "École Supérieure des Sciences Agronomiques (ESSA), Université d'Antananarivo"
+  - family-names: Ravonjiarison
+    given-names: Solofo Nasandratra
+    affiliation: "Laboratoire des Radioisotopes (LRI), Université d'Antananarivo"
+  - family-names: Razakamanarivo
+    given-names: Herintsitohaina
+    affiliation: "Laboratoire des Radioisotopes (LRI), Université d'Antananarivo"
+abstract: >-
+  R code for the statistical analyses, multivariate analyses (PCA, PERMANOVA)
+  and the nested spatial block cross-validated comparison of Random Forest,
+  GAM and LMM used to model and map carbon pools (SOC, AGC, BGC, deadwood,
+  litter, total C) in three Malagasy open-ecosystem sites, with bootstrap
+  uncertainty maps.
+keywords:
+  - carbon stock mapping
+  - soil organic carbon
+  - open ecosystems
+  - spatial cross-validation
+  - random forest
+  - Madagascar
+license: MIT
+repository-code: "https://github.com/YOUR-USERNAME/madagascar-open-ecosystem-carbon"
+version: "1.0.0"
+date-released: "2026-10-28"
