@@ -1,7 +1,7 @@
 ---
 title: "Carbon stock modelling and mapping in Malagasy open ecosystems"
 subtitle: "RF vs GAM vs LMM, site-specific spatial blocks chosen by prediction-distance matching, nested spatial block CV (10 outer / 5 inner), 100 bootstrap maps (v4)"
-author: "N. Ramifehiarivo et al."
+author: "Antsa Sarobidy"
 date: today
 format:
   html:
